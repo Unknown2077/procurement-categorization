@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+
+# Local environment and outputs
+.env
+output.json
+*.log
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+.c*/

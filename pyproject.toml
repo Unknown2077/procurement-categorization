@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "column-categorization-pipeline"
+version = "0.1.0"
+description = "Column categorization pipeline for public.original_data"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.76.0",
+  "psycopg[binary]>=3.2.6",
+  "pydantic>=2.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["column_categorization*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -1,0 +1,1 @@
+"""Column categorization package."""
