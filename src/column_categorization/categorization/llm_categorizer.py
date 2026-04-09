@@ -8,15 +8,15 @@ from openai import OpenAI
 
 from column_categorization.schemas.categorization import ValueMapping
 
-SYSTEM_PROMPT = """# High-Fidelity Taxonomy Designer
+SYSTEM_PROMPT = """# High-Fidelity Taxonomy Categorizer
 
 ## 1. Role Description
-Acts as a specialized Taxonomy Designer for technical and structured data. Its primary function is to transform raw, extracted concepts into a clean, canonical set of labels while strictly preserving specification-level differences.
+Acts as a specialized Taxonomy Categorizer for technical and structured data. Its primary function is to transform raw, extracted concepts into clean, canonical categories while strictly preserving specification-level differences.
 
 ## 2. Core Capabilities
-- Preserve technical specification differences as distinct labels.
+- Preserve technical specification differences as distinct categories.
 - Merge only near-duplicates, spelling errors, or exact synonyms.
-- Every label must be a concise noun phrase with 1-5 words.
+- Every category must be a concise noun phrase with 1-5 words.
 
 ## 3. Constraints
 - Never merge items with different technical attributes.
@@ -103,13 +103,18 @@ class OpenAILLMCategorizer:
             },
         }
         return (
-            "Categorize the following column values. "
-            "Use Indonesian labels only. "
+            "Perform categorization for the following column values. "
+            "Use Indonesian category names only. "
             "Return valid JSON only without markdown. "
-            "Each label must be a noun phrase with 1-5 words, strictly no exceptions. "
-            "Do not output any label longer than 5 words. "
-            "Valid label examples: 'Jasa Konsultansi', 'Perangkat Server', 'Lisensi ERP'. "
-            "Invalid label example: 'Kebersihan dan Keamanan Gedung Kantor Pusat'. "
+            "Return category values in the existing 'labels' field. "
+            "Each category must be a noun phrase with 1-5 words, strictly no exceptions. "
+            "Do not output any category longer than 5 words. "
+            "If one raw_value contains multiple services, split it into multiple categories. "
+            "For combined services joined by 'dan', output each service as a separate category. "
+            "Example mapping: raw_value 'Jasa Kebersihan dan Keamanan Gedung Kantor Pusat' "
+            "must map to labels ['Jasa Kebersihan', 'Jasa Keamanan']. "
+            "Valid category examples: 'Jasa Konsultansi', 'Perangkat Server', 'Lisensi ERP'. "
+            "Invalid category example: 'Kebersihan dan Keamanan Gedung Kantor Pusat'. "
             "Ensure each raw_value appears exactly once.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
@@ -117,9 +122,9 @@ class OpenAILLMCategorizer:
     def _build_retry_prompt(self, base_prompt: str) -> str:
         return (
             f"{base_prompt}\n\n"
-            "Correction required: your previous output used labels longer than 5 words. "
-            "Regenerate all labels so every label has 1-5 words only. "
-            "Keep JSON schema unchanged and keep one mapping for every raw_value."
+            "Correction required: your previous output used categories longer than 5 words. "
+            "Regenerate all categories so every category has 1-5 words only. "
+            "Keep JSON schema unchanged (including 'labels' field) and keep one mapping for every raw_value."
         )
 
     def _request_completion(self, user_prompt: str) -> str:
