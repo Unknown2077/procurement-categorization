@@ -1,38 +1,39 @@
-# Column Categorization Pipeline
+# Vendor-Agnostic ETL Categorization
 
-Python pipeline to read values from a source table, categorize them with an LLM provider, and return JSON output.
-
-## Input
-- `database_url`
-- `target_columns`: array of objects with:
-  - `name` (database column name)
-  - `description` (nullable, used as LLM context)
-
-## Output
-- JSON categorization result
-- No insert/create table operation
+This project reads raw values from PostgreSQL, categorizes them with an LLM, and loads results to a configurable sink (`file`, `http`, or `db`).
 
 ## Setup
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+cp .env.example .env
 ```
 
-Create `.env`:
-```env
-DATABASE_URL=postgresql://user:pass@host:5432/db_name
-NIM_API_KEY=your_api_key
-NIM_BASE_URL=https://your-llm-endpoint/v1
-NIM_MODEL=your-model-name
-```
+Fill `.env` first.
 
-## Run
+## Run (recommended)
+Interactive mode:
 ```bash
-.venv/bin/python scripts/run_column_categorization.py \
-  --target-columns-json '[{"name":"your_column_name","description":"Optional context"}]' \
-  --batch-size 10
+.venv/bin/python main.py
 ```
+
+Direct ETL mode:
+```bash
+.venv/bin/python main.py --mode etl
+```
+
+Direct manual mode (categorization only):
+```bash
+.venv/bin/python main.py --mode manual --target-columns-json '[{"name":"raw_value","description":"Raw procurement text"}]'
+```
+
+## Sink config (from `.env`)
+- `SINK_TYPE=file|http|db`
+- File: `SINK_FILE_PATH`, `SINK_FILE_FORMAT`
+- HTTP: `SINK_HTTP_BASE_URL`, `SINK_HTTP_PATH`, `SINK_HTTP_AUTH_TOKEN`
+- DB: `SINK_DB_URL`, `SINK_DB_SCHEMA`, `SINK_DB_TABLE`
 
 ## Notes
-- `batch-size` is the number of values per LLM request, not number of columns.
-- Use real database column names for `target_columns[].name`.
+- In file mode, output is reset once per ETL run, then each batch is appended.
+- Retry config: `LOAD_BATCH_SIZE`, `LOAD_MAX_RETRIES`, `LOAD_RETRY_DELAY_SECONDS`
+- Failed records are written to `LOAD_DEAD_LETTER_PATH`.

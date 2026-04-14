@@ -6,9 +6,15 @@ import os
 import sys
 
 from column_categorization.categorization.llm_categorizer import OpenAILLMCategorizer
+from column_categorization.config import load_etl_config_from_env, load_sink_config_from_env
 from column_categorization.db.postgres_reader import PostgresReader
-from column_categorization.pipelines.column_categorization import ColumnCategorizationPipeline
-from column_categorization.schemas.categorization import CategorizationRequest
+from column_categorization.pipelines.column_categorization import (
+    ColumnCategorizationPipeline,
+    RecordCategorizationPipeline,
+)
+from column_categorization.pipelines.etl_execution import EtlExecutionPipeline
+from column_categorization.schemas.categorization import CategorizationRequest, RecordCategorizationRequest
+from column_categorization.sinks.router import SinkRouter
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -16,7 +22,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database-url", required=False, default=None, help="PostgreSQL connection string")
     parser.add_argument(
         "--target-columns-json",
-        required=True,
+        required=False,
+        default=None,
         help='JSON array format: [{"name":"...", "description":"..."}]',
     )
     parser.add_argument("--batch-size", type=int, default=100, help="Rows per categorization batch")
@@ -25,6 +32,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nim-api-key", default=None, help="NVIDIA NIM API key")
     parser.add_argument("--nim-base-url", default=None, help="NVIDIA NIM base URL")
     parser.add_argument("--model", default=None, help="NVIDIA NIM model name")
+    parser.add_argument("--run-etl", action="store_true", help="Run end-to-end ETL mode")
+    parser.add_argument("--raw-id-column", default="source_event_id", help="Record identifier column")
+    parser.add_argument("--raw-value-column", default="raw_value", help="Raw value column to categorize")
+    parser.add_argument("--load-batch-size", type=int, default=None, help="Override LOAD_BATCH_SIZE")
+    parser.add_argument("--load-max-retries", type=int, default=None, help="Override LOAD_MAX_RETRIES")
+    parser.add_argument(
+        "--load-retry-delay-seconds",
+        type=int,
+        default=None,
+        help="Override LOAD_RETRY_DELAY_SECONDS",
+    )
+    parser.add_argument(
+        "--dead-letter-path",
+        default=None,
+        help="Override LOAD_DEAD_LETTER_PATH",
+    )
     return parser
 
 
@@ -62,6 +85,46 @@ def main() -> int:
     nim_base_url = arguments.nim_base_url or os.environ.get("NIM_BASE_URL")
     model = arguments.model or os.environ.get("NIM_MODEL") or "qwen/qwen3-next-80b-a3b-instruct"
 
+    if arguments.load_batch_size is not None:
+        os.environ["LOAD_BATCH_SIZE"] = str(arguments.load_batch_size)
+    if arguments.load_max_retries is not None:
+        os.environ["LOAD_MAX_RETRIES"] = str(arguments.load_max_retries)
+    if arguments.load_retry_delay_seconds is not None:
+        os.environ["LOAD_RETRY_DELAY_SECONDS"] = str(arguments.load_retry_delay_seconds)
+    if arguments.dead_letter_path is not None:
+        os.environ["LOAD_DEAD_LETTER_PATH"] = arguments.dead_letter_path
+
+    reader = PostgresReader(database_url=database_url)
+    categorizer = OpenAILLMCategorizer(
+        api_key=nim_api_key,
+        model=model,
+        base_url=nim_base_url,
+    )
+
+    if arguments.run_etl:
+        etl_request = RecordCategorizationRequest(
+            database_url=database_url,
+            schema_name=arguments.schema_name,
+            table_name=arguments.table_name,
+            id_column_name=arguments.raw_id_column,
+            raw_value_column_name=arguments.raw_value_column,
+            batch_size=arguments.batch_size,
+            model_name=model,
+        )
+        categorization_response = RecordCategorizationPipeline(reader=reader, categorizer=categorizer).run(etl_request)
+        sink_config = load_sink_config_from_env()
+        etl_config = load_etl_config_from_env()
+        sink = SinkRouter(sink_config=sink_config).build_sink()
+        execution_response = EtlExecutionPipeline(sink=sink, load_config=etl_config).run(
+            records=categorization_response.records,
+            categorization_error_count=len(categorization_response.errors),
+        )
+        print(execution_response.model_dump_json(indent=2, ensure_ascii=False))
+        return 0
+
+    if arguments.target_columns_json is None:
+        raise ValueError("--target-columns-json is required when --run-etl is not used")
+
     try:
         target_columns = json.loads(arguments.target_columns_json)
     except json.JSONDecodeError as error:
@@ -73,12 +136,6 @@ def main() -> int:
         batch_size=arguments.batch_size,
         schema_name=arguments.schema_name,
         table_name=arguments.table_name,
-    )
-    reader = PostgresReader(database_url=request.database_url)
-    categorizer = OpenAILLMCategorizer(
-        api_key=nim_api_key,
-        model=model,
-        base_url=nim_base_url,
     )
     pipeline = ColumnCategorizationPipeline(reader=reader, categorizer=categorizer)
     response = pipeline.run(request)

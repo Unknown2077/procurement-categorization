@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from psycopg import Connection, connect, sql
 
+from column_categorization.schemas.categorization import RawRecord
+
 
 class PostgresReader:
     def __init__(self, database_url: str) -> None:
@@ -23,6 +25,52 @@ class PostgresReader:
             rows = connection.execute(query).fetchall()
 
         return [row[0] for row in rows if isinstance(row[0], str) and row[0].strip()]
+
+    def fetch_raw_records(
+        self,
+        schema_name: str,
+        table_name: str,
+        id_column_name: str,
+        value_column_name: str,
+    ) -> list[RawRecord]:
+        if not schema_name.strip():
+            raise ValueError("schema_name must not be empty")
+        if not table_name.strip():
+            raise ValueError("table_name must not be empty")
+        if not id_column_name.strip():
+            raise ValueError("id_column_name must not be empty")
+        if not value_column_name.strip():
+            raise ValueError("value_column_name must not be empty")
+
+        with connect(self._database_url, options="-c default_transaction_read_only=on") as connection:
+            self._ensure_column_exists(
+                connection=connection,
+                schema_name=schema_name,
+                table_name=table_name,
+                column_name=id_column_name,
+            )
+            self._ensure_column_exists(
+                connection=connection,
+                schema_name=schema_name,
+                table_name=table_name,
+                column_name=value_column_name,
+            )
+            query = self._build_raw_records_query(
+                schema_name=schema_name,
+                table_name=table_name,
+                id_column_name=id_column_name,
+                value_column_name=value_column_name,
+            )
+            rows = connection.execute(query).fetchall()
+
+        output_records: list[RawRecord] = []
+        for row in rows:
+            source_event_id = str(row[0]).strip() if row[0] is not None else ""
+            raw_value = row[1].strip() if isinstance(row[1], str) else ""
+            if not source_event_id or not raw_value:
+                continue
+            output_records.append(RawRecord(source_event_id=source_event_id, raw_value=raw_value))
+        return output_records
 
     def _ensure_column_exists(
         self,
@@ -58,4 +106,27 @@ class PostgresReader:
             schema=sql.Identifier(schema_name),
             table=sql.Identifier(table_name),
             column=sql.Identifier(column_name),
+        )
+
+    def _build_raw_records_query(
+        self,
+        schema_name: str,
+        table_name: str,
+        id_column_name: str,
+        value_column_name: str,
+    ) -> sql.Composed:
+        return sql.SQL(
+            """
+            SELECT {id_column}, TRIM({value_column}::text) AS raw_value
+            FROM {schema}.{table}
+            WHERE {id_column} IS NOT NULL
+              AND {value_column} IS NOT NULL
+              AND TRIM({value_column}::text) <> ''
+            ORDER BY {id_column}
+            """
+        ).format(
+            id_column=sql.Identifier(id_column_name),
+            value_column=sql.Identifier(value_column_name),
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
         )
