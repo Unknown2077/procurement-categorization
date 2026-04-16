@@ -177,7 +177,7 @@ class RecordCategorizationPipeline:
                     source_event_id=raw_record.source_event_id,
                     raw_value=raw_record.raw_value,
                     labels=mapping.labels,
-                    confidence_score=None,
+                    confidence_score=0.0,
                     model_name=model_name,
                     categorized_at=categorized_at,
                 )

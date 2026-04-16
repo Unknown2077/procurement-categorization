@@ -60,16 +60,9 @@ class EtlExecutionPipeline:
                     time.sleep(self._load_config.load_retry_delay_seconds)
         if last_error is None:
             raise RuntimeError("Load retry finished without result and without exception")
-        failures = [
-            LoadFailure(source_event_id=record.source_event_id, error_message=str(last_error))
-            for record in records_batch
-        ]
-        return LoadResult(
-            sink_type=self._resolve_sink_type(),
-            total_records=len(records_batch),
-            loaded_records=0,
-            failed_records=len(records_batch),
-            failures=failures,
+        raise RuntimeError(
+            "Load failed after "
+            f"{self._load_config.load_max_retries + 1} attempts: {last_error}"
         )
 
     def _write_dead_letter_records(self, records: list[CategorizedRecord]) -> None:

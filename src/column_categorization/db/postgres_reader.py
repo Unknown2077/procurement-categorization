@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from psycopg import Connection, connect, sql
 
 from column_categorization.schemas.categorization import RawRecord
@@ -129,4 +131,73 @@ class PostgresReader:
             value_column=sql.Identifier(value_column_name),
             schema=sql.Identifier(schema_name),
             table=sql.Identifier(table_name),
+        )
+
+    def fetch_table_rows(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_names: Sequence[str],
+        order_by_column_name: str | None = None,
+    ) -> list[dict[str, object]]:
+        if not schema_name.strip():
+            raise ValueError("schema_name must not be empty")
+        if not table_name.strip():
+            raise ValueError("table_name must not be empty")
+        if not column_names:
+            raise ValueError("column_names must not be empty")
+
+        normalized_columns: list[str] = []
+        for column_name in column_names:
+            normalized_name = column_name.strip()
+            if not normalized_name:
+                raise ValueError("column_names must not contain empty values")
+            normalized_columns.append(normalized_name)
+
+        with connect(self._database_url, options="-c default_transaction_read_only=on") as connection:
+            for column_name in normalized_columns:
+                self._ensure_column_exists(
+                    connection=connection,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    column_name=column_name,
+                )
+            if order_by_column_name is not None:
+                self._ensure_column_exists(
+                    connection=connection,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    column_name=order_by_column_name,
+                )
+            query = self._build_table_rows_query(
+                schema_name=schema_name,
+                table_name=table_name,
+                column_names=normalized_columns,
+                order_by_column_name=order_by_column_name,
+            )
+            rows = connection.execute(query).fetchall()
+
+        output_rows: list[dict[str, object]] = []
+        for row in rows:
+            output_rows.append({column_name: row[index] for index, column_name in enumerate(normalized_columns)})
+        return output_rows
+
+    def _build_table_rows_query(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_names: Sequence[str],
+        order_by_column_name: str | None,
+    ) -> sql.Composed:
+        selected_columns = sql.SQL(", ").join(sql.Identifier(column_name) for column_name in column_names)
+        base_query = sql.SQL("SELECT {columns} FROM {schema}.{table}").format(
+            columns=selected_columns,
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
+        )
+        if order_by_column_name is None:
+            return base_query
+        return sql.SQL("{base} ORDER BY {order_column}").format(
+            base=base_query,
+            order_column=sql.Identifier(order_by_column_name),
         )
