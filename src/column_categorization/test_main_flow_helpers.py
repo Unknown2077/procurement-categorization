@@ -24,6 +24,43 @@ def test_parse_raw_columns_parses_comma_list() -> None:
     assert output == ["source_event_id", "raw_value", "notes"]
 
 
+def test_parse_categorized_columns_uses_fallback() -> None:
+    output = main._parse_categorized_columns(None, fallback_column="note")
+    assert output == ["note"]
+
+
+def test_parse_categorized_columns_parses_comma_list() -> None:
+    output = main._parse_categorized_columns("note, description", fallback_column="ignored")
+    assert output == ["note", "description"]
+
+
+def test_resolve_source_sql_uses_cli_value() -> None:
+    arguments = argparse.Namespace(source_sql="SELECT id, name FROM public.org")
+    output = main._resolve_source_sql(arguments)
+    assert output == "SELECT id, name FROM public.org"
+
+
+def test_resolve_source_sql_uses_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOURCE_SQL", "SELECT id, name, note FROM public.org")
+    arguments = argparse.Namespace(source_sql=None)
+    output = main._resolve_source_sql(arguments)
+    assert output == "SELECT id, name, note FROM public.org"
+
+
+def test_ensure_required_columns_raises_on_missing_column() -> None:
+    with pytest.raises(ValueError, match="source_sql result is missing required columns: note"):
+        main._ensure_required_columns(
+            available_columns=["id", "name"],
+            required_columns=["id", "note"],
+            source_label="source_sql result",
+        )
+
+
+def test_serialize_categorized_labels_returns_json_string() -> None:
+    output = main._serialize_categorized_labels(["Jasa Survei", "Jasa Pemetaan"])
+    assert output == "[\"Jasa Survei\", \"Jasa Pemetaan\"]"
+
+
 def test_build_api_check_url_uses_env_template_for_me(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_BASE_URL", "https://example-api.test")
     monkeypatch.setenv("API_PATH_AUTH_ME", "/api/v1/auth/me")

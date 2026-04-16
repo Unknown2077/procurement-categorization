@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -17,14 +18,13 @@ from column_categorization.config import (
 from column_categorization.db.postgres_reader import PostgresReader
 from column_categorization.pipelines.column_categorization import (
     ColumnCategorizationPipeline,
-    RecordCategorizationPipeline,
 )
-from column_categorization.pipelines.etl_execution import EtlExecutionPipeline
 from column_categorization.pipelines.raw_to_api import RawDbToApiPipeline, RawToApiRequest
-from column_categorization.schemas.categorization import CategorizationRequest, RecordCategorizationRequest
-from column_categorization.schemas.load import EtlExecutionResult, LoadResult
+from column_categorization.schemas.categorization import CategorizationRequest
+from column_categorization.schemas.load import LoadFailure, LoadResult
 from column_categorization.sinks.http_api_sink import HttpApiSink
 from column_categorization.sinks.router import SinkRouter
+from column_categorization.utils.batching import chunked
 
 
 def _load_dotenv_file(path: str = ".env") -> None:
@@ -58,13 +58,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schema-name", default="public", help="Schema name")
     parser.add_argument("--table-name", default="event_raw_staging", help="Table name")
     parser.add_argument("--batch-size", type=int, default=10, help="Values per categorization batch")
+    parser.add_argument(
+        "--source-sql",
+        default=None,
+        help="Custom SQL query for source extraction (overrides schema/table extract path)",
+    )
 
     parser.add_argument("--raw-id-column", default="source_event_id", help="ID column for ETL mode")
     parser.add_argument("--raw-value-column", default="raw_value", help="Raw text column for ETL mode")
     parser.add_argument(
         "--raw-columns",
         default=None,
-        help="Comma-separated DB columns to send directly in raw_to_api mode",
+        help="Comma-separated DB columns to read from source table",
+    )
+    parser.add_argument(
+        "--categorized-columns",
+        default=None,
+        help="Comma-separated source columns to categorize and append as <column>_categorized",
     )
     parser.add_argument(
         "--dry-run",
@@ -114,8 +124,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _prompt_mode() -> str:
     print("Select flow:")
-    print("1) raw_to_api        -> DB raw rows -> Erica API")
-    print("2) categorize_to_api -> DB -> categorize -> Erica API")
+    print("1) raw_to_api        -> DB raw rows -> destination API")
+    print("2) categorize_to_api -> DB -> categorize -> destination API")
     print("3) manual            -> prompt-driven ad-hoc mode")
     print("4) api_check         -> GET /me, /account, /datasets")
     selected = input("Enter choice [1/2/3/4] (default 2): ").strip()
@@ -142,6 +152,14 @@ def _resolve_database_url(arguments: argparse.Namespace) -> str:
     if not database_url:
         raise ValueError("DATABASE_URL is required in .env or --database-url")
     return database_url
+
+
+def _resolve_source_sql(arguments: argparse.Namespace) -> str | None:
+    source_sql = arguments.source_sql or os.environ.get("SOURCE_SQL")
+    if source_sql is None:
+        return None
+    normalized_source_sql = source_sql.strip()
+    return normalized_source_sql or None
 
 
 def _resolve_llm_runtime(arguments: argparse.Namespace) -> tuple[str, str | None, str]:
@@ -283,6 +301,33 @@ def _parse_raw_columns(raw_columns: str | None, fallback_columns: list[str]) -> 
     return parsed_columns
 
 
+def _parse_categorized_columns(categorized_columns: str | None, fallback_column: str) -> list[str]:
+    if categorized_columns is None:
+        return [fallback_column]
+    parsed_columns = [column.strip() for column in categorized_columns.split(",") if column.strip()]
+    if not parsed_columns:
+        raise ValueError("categorized_columns must contain at least one column name")
+    return parsed_columns
+
+
+def _ensure_required_columns(
+    available_columns: list[str],
+    required_columns: list[str],
+    source_label: str,
+) -> None:
+    missing_columns = sorted({column for column in required_columns if column not in set(available_columns)})
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise ValueError(
+            f"{source_label} is missing required columns: {missing_text}. "
+            "Ensure SQL uses matching aliases for --raw-columns/--raw-id-column/--categorized-columns."
+        )
+
+
+def _serialize_categorized_labels(labels: list[str]) -> str:
+    return json.dumps(labels, ensure_ascii=False)
+
+
 def _ensure_http_sink() -> HttpApiSink:
     sink_config = load_sink_config_from_env()
     if sink_config.sink_type != "http":
@@ -312,26 +357,31 @@ def _summarize_load_result(
     }
 
 
-def _summarize_execution_result(
-    execution: EtlExecutionResult,
-    max_failures: int = 5,
-    max_dead_letter_records: int = 3,
-) -> dict[str, Any]:
-    return {
-        "flow": "categorize_to_api",
-        "total_categorized_records": execution.total_categorized_records,
-        "total_errors": execution.total_errors,
-        "load_result": _summarize_load_result(execution.load_result, max_failures=max_failures),
-        "dead_letter_count": len(execution.dead_letter_records),
-        "dead_letter_preview": [
-            record.model_dump(mode="json") for record in execution.dead_letter_records[:max_dead_letter_records]
-        ],
-    }
+def _load_rows_with_retry(
+    sink: HttpApiSink,
+    rows_batch: list[dict[str, object]],
+    load_max_retries: int,
+    retry_delay_seconds: int,
+) -> LoadResult:
+    last_error: Exception | None = None
+    for attempt in range(load_max_retries + 1):
+        try:
+            return sink.load_rows(rows_batch)
+        except Exception as error:
+            last_error = error
+            if attempt >= load_max_retries:
+                break
+            if retry_delay_seconds > 0:
+                time.sleep(retry_delay_seconds)
+    if last_error is None:
+        raise RuntimeError("Load retry finished without result and without exception")
+    raise RuntimeError(f"Load failed after {load_max_retries + 1} attempts: {last_error}")
 
 
 def _run_raw_to_api_mode(
     arguments: argparse.Namespace,
     database_url: str,
+    source_sql: str | None,
     dry_run: bool,
 ) -> int:
     reader = PostgresReader(database_url=database_url)
@@ -340,20 +390,59 @@ def _run_raw_to_api_mode(
         arguments.raw_columns,
         fallback_columns=[arguments.raw_id_column, arguments.raw_value_column],
     )
-    request = RawToApiRequest(
-        schema_name=arguments.schema_name,
-        table_name=arguments.table_name,
-        columns=raw_columns,
-        order_by_column=arguments.raw_id_column,
-        dry_run=dry_run,
-    )
-    result = RawDbToApiPipeline(reader=reader, sink=sink, load_config=load_etl_config_from_env()).run(request)
+    total_rows: int
+    sample_rows: list[dict[str, object]]
+    load_result: LoadResult | None
+    if source_sql is None:
+        request = RawToApiRequest(
+            schema_name=arguments.schema_name,
+            table_name=arguments.table_name,
+            columns=raw_columns,
+            order_by_column=arguments.raw_id_column,
+            dry_run=dry_run,
+        )
+        result = RawDbToApiPipeline(reader=reader, sink=sink, load_config=load_etl_config_from_env()).run(request)
+        total_rows = result.total_rows
+        sample_rows = result.sample_rows
+        load_result = result.load_result
+    else:
+        source_rows, source_columns = reader.fetch_rows_and_columns_by_sql(source_sql)
+        _ensure_required_columns(
+            available_columns=source_columns,
+            required_columns=list(dict.fromkeys(raw_columns + [arguments.raw_id_column])),
+            source_label="source_sql result",
+        )
+        projected_rows = [{column: source_row[column] for column in raw_columns} for source_row in source_rows]
+        total_rows = len(projected_rows)
+        sample_rows = projected_rows[:3]
+        if dry_run:
+            load_result = None
+        else:
+            load_config = load_etl_config_from_env()
+            aggregate_failures: list[LoadFailure] = []
+            loaded_records = 0
+            for rows_batch in chunked(projected_rows, load_config.load_batch_size):
+                batch_result = _load_rows_with_retry(
+                    sink=sink,
+                    rows_batch=rows_batch,
+                    load_max_retries=load_config.load_max_retries,
+                    retry_delay_seconds=load_config.load_retry_delay_seconds,
+                )
+                loaded_records += batch_result.loaded_records
+                aggregate_failures.extend(batch_result.failures)
+            load_result = LoadResult(
+                sink_type="http",
+                total_records=len(projected_rows),
+                loaded_records=loaded_records,
+                failed_records=len(aggregate_failures),
+                failures=aggregate_failures,
+            )
     output = {
         "flow": "raw_to_api",
-        "dry_run": result.dry_run,
-        "total_rows": result.total_rows,
-        "sample_rows": result.sample_rows,
-        "load_result": _summarize_load_result(result.load_result),
+        "dry_run": dry_run,
+        "total_rows": total_rows,
+        "sample_rows": sample_rows,
+        "load_result": _summarize_load_result(load_result),
     }
     print(json.dumps(output, indent=2, ensure_ascii=False))
     return 0
@@ -362,46 +451,126 @@ def _run_raw_to_api_mode(
 def _run_categorize_to_api_mode(
     arguments: argparse.Namespace,
     database_url: str,
+    source_sql: str | None,
     nim_api_key: str,
     nim_base_url: str | None,
     model: str,
     dry_run: bool,
 ) -> int:
-    _ensure_http_sink()
     reader = PostgresReader(database_url=database_url)
     categorizer = OpenAILLMCategorizer(
         api_key=nim_api_key,
         model=model,
         base_url=nim_base_url,
     )
-    request = RecordCategorizationRequest(
-        database_url=database_url,
-        schema_name=arguments.schema_name,
-        table_name=arguments.table_name,
-        id_column_name=arguments.raw_id_column,
-        raw_value_column_name=arguments.raw_value_column,
-        batch_size=arguments.batch_size,
-        model_name=model,
+    selected_columns = _parse_raw_columns(
+        arguments.raw_columns,
+        fallback_columns=[arguments.raw_id_column, arguments.raw_value_column],
     )
-    categorized = RecordCategorizationPipeline(reader=reader, categorizer=categorizer).run(request)
+    categorized_columns = _parse_categorized_columns(
+        arguments.categorized_columns,
+        fallback_column=arguments.raw_value_column,
+    )
+    for categorized_column in categorized_columns:
+        if categorized_column not in selected_columns:
+            selected_columns.append(categorized_column)
+    if source_sql is None:
+        source_rows = reader.fetch_table_rows(
+            schema_name=arguments.schema_name,
+            table_name=arguments.table_name,
+            column_names=selected_columns,
+            order_by_column_name=arguments.raw_id_column,
+        )
+    else:
+        source_rows, source_columns = reader.fetch_rows_and_columns_by_sql(source_sql)
+        _ensure_required_columns(
+            available_columns=source_columns,
+            required_columns=list(dict.fromkeys(selected_columns + categorized_columns + [arguments.raw_id_column])),
+            source_label="source_sql result",
+        )
+        source_rows = [{column: source_row[column] for column in selected_columns} for source_row in source_rows]
+    categorized_rows = [dict(source_row) for source_row in source_rows]
+    categorization_errors: list[dict[str, object]] = []
+    for categorized_column in categorized_columns:
+        distinct_values = sorted(
+            {
+                value.strip()
+                for source_row in source_rows
+                for value in [source_row.get(categorized_column)]
+                if isinstance(value, str) and value.strip()
+            }
+        )
+        mapping_by_raw_value: dict[str, list[str]] = {}
+        for batch_index, values_batch in enumerate(chunked(distinct_values, arguments.batch_size), start=1):
+            try:
+                categorized_batch = categorizer.categorize_batch(
+                    column_name=categorized_column,
+                    column_description=None,
+                    raw_values=values_batch,
+                )
+            except Exception as error:
+                categorization_errors.append(
+                    {
+                        "column_name": categorized_column,
+                        "batch_index": batch_index,
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                    }
+                )
+                continue
+            for mapping in categorized_batch.mappings:
+                mapping_by_raw_value[mapping.raw_value] = mapping.labels
+
+        categorized_key = f"{categorized_column}_categorized"
+        for categorized_row in categorized_rows:
+            source_value = categorized_row.get(categorized_column)
+            if isinstance(source_value, str):
+                labels = mapping_by_raw_value.get(source_value.strip(), [])
+                categorized_row[categorized_key] = _serialize_categorized_labels(labels)
+            else:
+                categorized_row[categorized_key] = _serialize_categorized_labels([])
+
     if dry_run:
         output = {
             "flow": "categorize_to_api",
             "dry_run": True,
-            "total_input_rows": categorized.total_input_rows,
-            "total_distinct_values": categorized.total_distinct_values,
-            "total_categorized_records": len(categorized.records),
-            "errors": [error.model_dump(mode="json") for error in categorized.errors],
-            "sample_records": [record.model_dump(mode="json") for record in categorized.records[:3]],
+            "categorized_columns": categorized_columns,
+            "total_input_rows": len(source_rows),
+            "total_categorized_rows": len(categorized_rows),
+            "errors": categorization_errors,
+            "sample_records": categorized_rows[:3],
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
         return 0
     sink = _ensure_http_sink()
-    execution = EtlExecutionPipeline(sink=sink, load_config=load_etl_config_from_env()).run(
-        records=categorized.records,
-        categorization_error_count=len(categorized.errors),
+    load_config = load_etl_config_from_env()
+    aggregate_failures: list[LoadFailure] = []
+    loaded_records = 0
+    for rows_batch in chunked(categorized_rows, load_config.load_batch_size):
+        batch_result = _load_rows_with_retry(
+            sink=sink,
+            rows_batch=rows_batch,
+            load_max_retries=load_config.load_max_retries,
+            retry_delay_seconds=load_config.load_retry_delay_seconds,
+        )
+        loaded_records += batch_result.loaded_records
+        aggregate_failures.extend(batch_result.failures)
+    load_result = LoadResult(
+        sink_type="http",
+        total_records=len(categorized_rows),
+        loaded_records=loaded_records,
+        failed_records=len(aggregate_failures),
+        failures=aggregate_failures,
     )
-    print(json.dumps(_summarize_execution_result(execution), indent=2, ensure_ascii=False))
+    output = {
+        "flow": "categorize_to_api",
+        "categorized_columns": categorized_columns,
+        "total_input_rows": len(source_rows),
+        "total_categorized_rows": len(categorized_rows),
+        "categorization_errors": categorization_errors,
+        "load_result": _summarize_load_result(load_result),
+    }
+    print(json.dumps(output, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -446,8 +615,10 @@ def _run_manual_mode(arguments: argparse.Namespace) -> int:
     selected_action = input("Enter action [1/2/3/4] (default 3): ").strip()
     if selected_action == "1":
         database_url = _resolve_database_url(arguments)
+        arguments.source_sql = _prompt_text("Source SQL (optional)", arguments.source_sql or "")
+        source_sql = _resolve_source_sql(arguments)
         run_dry = _prompt_text("Dry run (yes/no)", "yes").lower() == "yes"
-        return _run_raw_to_api_mode(arguments, database_url=database_url, dry_run=run_dry)
+        return _run_raw_to_api_mode(arguments, database_url=database_url, source_sql=source_sql, dry_run=run_dry)
     if selected_action == "4":
         arguments.api_check_mode = _prompt_text("API check mode (me/account/datasets)", arguments.api_check_mode)
         if arguments.api_check_mode not in {"me", "account", "datasets"}:
@@ -457,10 +628,13 @@ def _run_manual_mode(arguments: argparse.Namespace) -> int:
     nim_api_key, nim_base_url, model = _resolve_llm_runtime(arguments)
     if selected_action == "2":
         database_url = _resolve_database_url(arguments)
+        arguments.source_sql = _prompt_text("Source SQL (optional)", arguments.source_sql or "")
+        source_sql = _resolve_source_sql(arguments)
         run_dry = _prompt_text("Dry run (yes/no)", "yes").lower() == "yes"
         return _run_categorize_to_api_mode(
             arguments=arguments,
             database_url=database_url,
+            source_sql=source_sql,
             nim_api_key=nim_api_key,
             nim_base_url=nim_base_url,
             model=model,
@@ -500,18 +674,37 @@ def main() -> int:
                     "Raw columns (comma-separated)",
                     f"{arguments.raw_id_column},{arguments.raw_value_column}",
                 )
+                arguments.source_sql = _prompt_text("Source SQL (optional)", arguments.source_sql or "")
+            if selected_mode == "categorize_to_api":
+                arguments.raw_columns = _prompt_text(
+                    "Source columns (comma-separated)",
+                    f"{arguments.raw_id_column},{arguments.raw_value_column}",
+                )
+                arguments.categorized_columns = _prompt_text(
+                    "Columns to categorize (comma-separated)",
+                    arguments.raw_value_column,
+                )
+                arguments.source_sql = _prompt_text("Source SQL (optional)", arguments.source_sql or "")
 
     if selected_mode == "api_check":
         return _run_api_check_mode(arguments)
     if selected_mode == "raw_to_api":
         database_url = _resolve_database_url(arguments)
-        return _run_raw_to_api_mode(arguments=arguments, database_url=database_url, dry_run=arguments.dry_run)
+        source_sql = _resolve_source_sql(arguments)
+        return _run_raw_to_api_mode(
+            arguments=arguments,
+            database_url=database_url,
+            source_sql=source_sql,
+            dry_run=arguments.dry_run,
+        )
     if selected_mode == "categorize_to_api":
         database_url = _resolve_database_url(arguments)
+        source_sql = _resolve_source_sql(arguments)
         nim_api_key, nim_base_url, model = _resolve_llm_runtime(arguments)
         return _run_categorize_to_api_mode(
             arguments=arguments,
             database_url=database_url,
+            source_sql=source_sql,
             nim_api_key=nim_api_key,
             nim_base_url=nim_base_url,
             model=model,

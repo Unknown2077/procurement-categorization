@@ -20,6 +20,8 @@ DATASET_UID=replace_me
 API_PATH_INSERT_DATA=/api/v1/accounts/{account_uid}/datasets/{dataset_uid}/data
 SINK_HTTP_PATH={API_PATH_INSERT_DATA}
 SINK_HTTP_AUTH_TOKEN=replace_me
+# Optional source override:
+# SOURCE_SQL=SELECT id, name, note FROM public.org
 ```
 
 ## Run (recommended)
@@ -29,8 +31,8 @@ Interactive mode:
 ```
 
 ## Choose a Flow
-- `raw_to_api`: read selected raw columns from DB and send directly to Erica API
-- `categorize_to_api`: read DB, run LLM categorization, then send to Erica API
+- `raw_to_api`: read selected raw columns from DB and send directly to destination API
+- `categorize_to_api`: read DB, run LLM categorization, then send to destination API
 - `manual`: prompt-driven mode for ad-hoc runs (`raw_to_api`, `categorize_to_api`, or `categorize_only`)
 - `api_check`: run GET checks (`me`, `account`, `datasets`) from `main.py`
 
@@ -42,6 +44,16 @@ Direct raw flow:
 Direct categorize flow:
 ```bash
 .venv/bin/python main.py --mode categorize_to_api
+```
+
+Categorize flow with custom SQL source:
+```bash
+.venv/bin/python main.py \
+  --mode categorize_to_api \
+  --source-sql "SELECT id, name, note FROM public.org" \
+  --raw-id-column id \
+  --raw-columns "id,name,note" \
+  --categorized-columns "note"
 ```
 
 Direct manual mode:
@@ -70,6 +82,10 @@ API path templates:
 - `API_PATH_INSERT_DATA`
 
 ## Notes
+- Source priority: `--source-sql` or `SOURCE_SQL` (if set) overrides schema/table extraction.
+- For custom SQL, aliases must match `--raw-columns`, `--raw-id-column`, and `--categorized-columns`.
+- Categorized output columns like `note_categorized` are sent as JSON string values (for string-typed datasets).
+- If your destination schema supports array/json types, remove JSON-string serialization and send list values directly.
 - Use placeholders in env paths (for example `{account_uid}`, `{dataset_uid}`).
 - In file mode, output is reset once per ETL run, then each batch is appended.
 - Retry config: `LOAD_BATCH_SIZE`, `LOAD_MAX_RETRIES`, `LOAD_RETRY_DELAY_SECONDS`

@@ -182,6 +182,28 @@ class PostgresReader:
             output_rows.append({column_name: row[index] for index, column_name in enumerate(normalized_columns)})
         return output_rows
 
+    def fetch_rows_by_sql(self, query: str) -> list[dict[str, object]]:
+        rows, _ = self.fetch_rows_and_columns_by_sql(query=query)
+        return rows
+
+    def fetch_rows_and_columns_by_sql(self, query: str) -> tuple[list[dict[str, object]], list[str]]:
+        normalized_query = query.strip()
+        if not normalized_query:
+            raise ValueError("source_sql must not be empty")
+
+        with connect(self._database_url, options="-c default_transaction_read_only=on") as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(normalized_query)
+                rows = cursor.fetchall()
+                if cursor.description is None:
+                    raise ValueError("source_sql must return rows with named columns")
+                column_names = [column.name for column in cursor.description]
+
+        output_rows: list[dict[str, object]] = []
+        for row in rows:
+            output_rows.append({column_name: row[index] for index, column_name in enumerate(column_names)})
+        return output_rows, column_names
+
     def _build_table_rows_query(
         self,
         schema_name: str,
