@@ -4,7 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Protocol
 
-from openai import OpenAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from column_categorization.schemas.categorization import ValueMapping
 
@@ -46,15 +47,24 @@ class OpenAILLMCategorizer:
         api_key: str,
         model: str = "qwen/qwen3-next-80b-a3b-instruct",
         base_url: str | None = None,
-        client: OpenAI | None = None,
+        client: ChatOpenAI | None = None,
     ) -> None:
         if client is None:
             if not api_key.strip():
-                raise ValueError("NIM_API_KEY must not be empty")
-            client_kwargs: dict[str, str] = {"api_key": api_key}
+                raise ValueError("LLM_API_KEY must not be empty")
             if base_url is not None and base_url.strip():
-                client_kwargs["base_url"] = base_url
-            self._client = OpenAI(**client_kwargs)
+                self._client = ChatOpenAI(
+                    api_key=api_key,
+                    base_url=base_url.strip(),
+                    model=model,
+                    temperature=0,
+                )
+            else:
+                self._client = ChatOpenAI(
+                    api_key=api_key,
+                    model=model,
+                    temperature=0,
+                )
         else:
             self._client = client
         self._model = model
@@ -128,15 +138,14 @@ class OpenAILLMCategorizer:
         )
 
     def _request_completion(self, user_prompt: str) -> str:
-        completion = self._client.chat.completions.create(
-            model=self._model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        message_content = completion.choices[0].message.content
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_prompt),
+        ]
+        completion = self._client.bind(model=self._model).invoke(messages)
+        if not isinstance(completion, AIMessage):
+            raise TypeError(f"Expected AIMessage from chat model, got {type(completion).__name__}")
+        message_content = completion.content
         raw_output = message_content if isinstance(message_content, str) else ""
         if not raw_output.strip():
             raise ValueError("LLM returned an empty response")

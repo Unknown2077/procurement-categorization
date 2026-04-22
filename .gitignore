@@ -6,7 +6,11 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv312/
 venv/
+.uv-cache/
+.uv-python/
+uv.lock*
 
 # Build and packaging
 build/
@@ -18,11 +22,14 @@ outputs/
 # Test and coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
 tests/
 
 # Local environment and outputs
 .env
+.env.*
+!.env.example
 output.json
 *.log
 

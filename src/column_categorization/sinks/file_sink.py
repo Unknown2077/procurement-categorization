@@ -32,6 +32,21 @@ class FileSink:
             failures=[],
         )
 
+    def load_rows(self, rows: list[dict[str, object]]) -> LoadResult:
+        self._output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._output_format != "jsonl":
+            raise ValueError("load_rows currently supports jsonl output only")
+        with self._output_path.open("a", encoding="utf-8") as output_file:
+            for row in rows:
+                output_file.write(f"{json.dumps(row, ensure_ascii=False)}\n")
+        return LoadResult(
+            sink_type="file",
+            total_records=len(rows),
+            loaded_records=len(rows),
+            failed_records=0,
+            failures=[],
+        )
+
     def reset_output(self) -> None:
         self._output_path.parent.mkdir(parents=True, exist_ok=True)
         if self._output_path.exists():

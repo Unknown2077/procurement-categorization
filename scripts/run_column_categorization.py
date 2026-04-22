@@ -19,7 +19,12 @@ from column_categorization.sinks.router import SinkRouter
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run column categorization pipeline")
-    parser.add_argument("--database-url", required=False, default=None, help="PostgreSQL connection string")
+    parser.add_argument(
+        "--database-url",
+        required=False,
+        default=None,
+        help="PostgreSQL connection string (overrides DB_URL / DATABASE_URL from env)",
+    )
     parser.add_argument(
         "--target-columns-json",
         required=False,
@@ -29,13 +34,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=100, help="Rows per categorization batch")
     parser.add_argument("--schema-name", default="public", help="Schema name")
     parser.add_argument("--table-name", default="original_data", help="Table name")
-    parser.add_argument("--nim-api-key", default=None, help="NVIDIA NIM API key")
-    parser.add_argument("--nim-base-url", default=None, help="NVIDIA NIM base URL")
-    parser.add_argument("--model", default=None, help="NVIDIA NIM model name")
+    parser.add_argument("--llm-api-key", default=None, help="LLM API key")
+    parser.add_argument("--llm-base-url", default=None, help="LLM base URL")
+    parser.add_argument("--llm-model", default=None, help="LLM model id")
+    parser.add_argument("--nim-api-key", dest="llm_api_key", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--nim-base-url", dest="llm_base_url", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--model", dest="llm_model", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--run-etl", action="store_true", help="Run end-to-end ETL mode")
     parser.add_argument("--raw-id-column", default="source_event_id", help="Record identifier column")
     parser.add_argument("--raw-value-column", default="raw_value", help="Raw value column to categorize")
-    parser.add_argument("--load-batch-size", type=int, default=None, help="Override LOAD_BATCH_SIZE")
+    parser.add_argument(
+        "--load-batch-size",
+        type=int,
+        default=None,
+        help="Override BATCH_PROCESS (load batch size from neutral env contract)",
+    )
     parser.add_argument("--load-max-retries", type=int, default=None, help="Override LOAD_MAX_RETRIES")
     parser.add_argument(
         "--load-retry-delay-seconds",
@@ -46,7 +59,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dead-letter-path",
         default=None,
-        help="Override LOAD_DEAD_LETTER_PATH",
+        help="Override DEAD_LETTER_PATH",
     )
     return parser
 
@@ -74,31 +87,40 @@ def main() -> int:
     parser = _build_parser()
     arguments = parser.parse_args()
 
-    database_url = arguments.database_url or os.environ.get("DATABASE_URL")
+    database_url = (
+        arguments.database_url or os.environ.get("DB_URL") or os.environ.get("DATABASE_URL")
+    )
     if not database_url:
-        raise ValueError("database_url is required via --database-url or DATABASE_URL")
+        raise ValueError("database_url is required via --database-url or DB_URL (or legacy DATABASE_URL)")
 
-    nim_api_key = arguments.nim_api_key or os.environ.get("NIM_API_KEY")
-    if not nim_api_key:
-        raise ValueError("NIM API key is required via --nim-api-key or NIM_API_KEY")
+    llm_api_key = arguments.llm_api_key or os.environ.get("LLM_API_KEY") or os.environ.get("NIM_API_KEY")
+    if not llm_api_key:
+        raise ValueError(
+            "LLM API key is required via --llm-api-key / --nim-api-key or LLM_API_KEY (or legacy NIM_API_KEY)"
+        )
 
-    nim_base_url = arguments.nim_base_url or os.environ.get("NIM_BASE_URL")
-    model = arguments.model or os.environ.get("NIM_MODEL") or "qwen/qwen3-next-80b-a3b-instruct"
+    llm_base_url = arguments.llm_base_url or os.environ.get("LLM_BASE_URL") or os.environ.get("NIM_BASE_URL")
+    llm_model = (
+        arguments.llm_model
+        or os.environ.get("LLM_MODEL")
+        or os.environ.get("NIM_MODEL")
+        or "qwen/qwen3-next-80b-a3b-instruct"
+    )
 
     if arguments.load_batch_size is not None:
-        os.environ["LOAD_BATCH_SIZE"] = str(arguments.load_batch_size)
+        os.environ["BATCH_PROCESS"] = str(arguments.load_batch_size)
     if arguments.load_max_retries is not None:
         os.environ["LOAD_MAX_RETRIES"] = str(arguments.load_max_retries)
     if arguments.load_retry_delay_seconds is not None:
         os.environ["LOAD_RETRY_DELAY_SECONDS"] = str(arguments.load_retry_delay_seconds)
     if arguments.dead_letter_path is not None:
-        os.environ["LOAD_DEAD_LETTER_PATH"] = arguments.dead_letter_path
+        os.environ["DEAD_LETTER_PATH"] = arguments.dead_letter_path
 
     reader = PostgresReader(database_url=database_url)
     categorizer = OpenAILLMCategorizer(
-        api_key=nim_api_key,
-        model=model,
-        base_url=nim_base_url,
+        api_key=llm_api_key,
+        model=llm_model,
+        base_url=llm_base_url,
     )
 
     if arguments.run_etl:
@@ -109,7 +131,7 @@ def main() -> int:
             id_column_name=arguments.raw_id_column,
             raw_value_column_name=arguments.raw_value_column,
             batch_size=arguments.batch_size,
-            model_name=model,
+            model_name=llm_model,
         )
         categorization_response = RecordCategorizationPipeline(reader=reader, categorizer=categorizer).run(etl_request)
         sink_config = load_sink_config_from_env()
