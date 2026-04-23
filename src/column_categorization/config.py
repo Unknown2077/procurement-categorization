@@ -50,6 +50,8 @@ class NeutralRuntimeConfig:
     llm_model: str
     llm_api_key: str
     llm_base_url: str | None
+    source_row_limit: int = 10
+    preview_row_limit: int = 10
 
 
 def load_neutral_runtime_config_from_env() -> NeutralRuntimeConfig:
@@ -69,6 +71,8 @@ def load_neutral_runtime_config_from_env() -> NeutralRuntimeConfig:
     llm_model = _read_required_env("LLM_MODEL")
     llm_api_key = _read_required_env("LLM_API_KEY")
     llm_base_url = _read_optional_env("LLM_BASE_URL")
+    source_row_limit = _read_int_env("SOURCE_ROW_LIMIT", default_value=10, minimum_value=1)
+    preview_row_limit = _read_int_env("PREVIEW_ROW_LIMIT", default_value=10, minimum_value=1)
     if target_type == "api":
         if target_api_base_url is None:
             raise ValueError("TARGET_API_BASE_URL is required when TARGET_TYPE=api")
@@ -98,6 +102,8 @@ def load_neutral_runtime_config_from_env() -> NeutralRuntimeConfig:
         llm_model=llm_model,
         llm_api_key=llm_api_key,
         llm_base_url=llm_base_url,
+        source_row_limit=source_row_limit,
+        preview_row_limit=preview_row_limit,
     )
 
 

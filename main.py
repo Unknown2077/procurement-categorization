@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -87,6 +88,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="SQL query for source extraction (overrides SOURCE_QUERY from neutral env)",
     )
+    parser.add_argument(
+        "--source-row-limit",
+        type=int,
+        default=None,
+        help="Max rows fetched from source query (overrides SOURCE_ROW_LIMIT from env)",
+    )
+    parser.add_argument(
+        "--preview-row-limit",
+        type=int,
+        default=None,
+        help="Max rows shown in sample_rows/sample_records (overrides PREVIEW_ROW_LIMIT from env)",
+    )
 
     parser.add_argument("--raw-id-column", default="source_event_id", help="ID column for ETL mode")
     parser.add_argument("--raw-value-column", default="raw_value", help="Raw text column for ETL mode")
@@ -167,25 +180,20 @@ def _prompt_yes_no(label: str, default_yes: bool = True) -> bool:
     return _prompt_text(label, default_value).lower() == "yes"
 
 
+def _default_raw_to_api_test_query() -> str:
+    return "SELECT * FROM external_vendor.vw_procurement_source ORDER BY source_event_id"
+
+
 def _configure_interactive_query_first_mode(arguments: argparse.Namespace, selected_mode: str) -> None:
+    neutral = load_neutral_runtime_config_from_env()
+    resolved_source_sql = _resolve_source_query(arguments, neutral)
+    default_source_sql = (resolved_source_sql or "").strip()
+    if not default_source_sql and selected_mode == "raw_to_api":
+        default_source_sql = _default_raw_to_api_test_query()
     arguments.source_sql = _prompt_text(
         "SOURCE_QUERY / SQL (blank uses SOURCE_QUERY from .env)",
-        arguments.source_sql or "",
+        default_source_sql,
     )
-    if not _prompt_yes_no("Customize advanced column options? (yes/no)", default_yes=False):
-        arguments.dry_run = _prompt_yes_no("Dry run (yes/no)", default_yes=True)
-        print(f"Dry run: {'enabled' if arguments.dry_run else 'disabled'} (no API load when enabled)")
-        return
-    arguments.raw_id_column = _prompt_text("Raw ID column", arguments.raw_id_column)
-    arguments.raw_value_column = _prompt_text("Raw value column", arguments.raw_value_column)
-    default_raw_columns = f"{arguments.raw_id_column},{arguments.raw_value_column}"
-    arguments.raw_columns = _prompt_text("Source columns (comma-separated)", arguments.raw_columns or default_raw_columns)
-    if selected_mode == "categorize_to_api":
-        arguments.categorized_columns = _prompt_text(
-            "Columns to categorize (comma-separated)",
-            arguments.categorized_columns or arguments.raw_value_column,
-        )
-    arguments.batch_size = int(_prompt_text("Batch size", str(arguments.batch_size or 10)))
     arguments.dry_run = _prompt_yes_no("Dry run (yes/no)", default_yes=True)
     print(f"Dry run: {'enabled' if arguments.dry_run else 'disabled'} (no API load when enabled)")
 
@@ -231,10 +239,141 @@ def _resolve_effective_batch_size(arguments: argparse.Namespace, neutral: Neutra
     return neutral.batch_process
 
 
+def _resolve_source_row_limit(arguments: argparse.Namespace, neutral: NeutralRuntimeConfig) -> int:
+    source_row_limit = arguments.source_row_limit
+    if source_row_limit is None:
+        source_row_limit = neutral.source_row_limit
+    if source_row_limit <= 0:
+        raise ValueError(f"source row limit must be >= 1, got {source_row_limit}")
+    return source_row_limit
+
+
+def _resolve_preview_row_limit(arguments: argparse.Namespace, neutral: NeutralRuntimeConfig) -> int:
+    preview_row_limit = arguments.preview_row_limit
+    if preview_row_limit is None:
+        preview_row_limit = neutral.preview_row_limit
+    if preview_row_limit <= 0:
+        raise ValueError(f"preview row limit must be >= 1, got {preview_row_limit}")
+    return preview_row_limit
+
+
+def _match_column_name(available_columns: list[str], candidate_names: list[str]) -> str | None:
+    available_by_lower = {column.lower(): column for column in available_columns}
+    for candidate_name in candidate_names:
+        matched = available_by_lower.get(candidate_name.lower())
+        if matched is not None:
+            return matched
+    return None
+
+
+def _find_first_text_column(
+    source_rows: list[dict[str, object]],
+    source_columns: list[str],
+    excluded_columns: set[str] | None = None,
+) -> str | None:
+    excluded = excluded_columns or set()
+    for column in source_columns:
+        if column in excluded:
+            continue
+        for source_row in source_rows:
+            value = source_row.get(column)
+            if isinstance(value, str) and value.strip():
+                return column
+    return None
+
+
+def _find_uuid_like_column(
+    source_rows: list[dict[str, object]],
+    source_columns: list[str],
+) -> str | None:
+    uuid_pattern = re.compile(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    )
+    for column in source_columns:
+        for source_row in source_rows:
+            value = source_row.get(column)
+            if isinstance(value, str) and uuid_pattern.match(value.strip()):
+                return column
+    return None
+
+
+def _resolve_effective_raw_id_column(
+    preferred_column: str,
+    source_columns: list[str],
+    source_rows: list[dict[str, object]],
+) -> str:
+    if preferred_column in source_columns:
+        return preferred_column
+    candidate_match = _match_column_name(
+        source_columns,
+        [
+            "source_event_id",
+            "event_id",
+            "source_id",
+            "id",
+            "uuid",
+            "external_uuid",
+        ],
+    )
+    if candidate_match is not None:
+        print(f"Auto-resolved raw ID column: {preferred_column!r} -> {candidate_match!r}")
+        return candidate_match
+    suffixed_id = next((column for column in source_columns if column.lower().endswith("_id")), None)
+    if suffixed_id is not None:
+        print(f"Auto-resolved raw ID column: {preferred_column!r} -> {suffixed_id!r}")
+        return suffixed_id
+    uuid_column = _find_uuid_like_column(source_rows=source_rows, source_columns=source_columns)
+    if uuid_column is not None:
+        print(f"Auto-resolved raw ID column: {preferred_column!r} -> {uuid_column!r}")
+        return uuid_column
+    if source_columns:
+        fallback_column = source_columns[0]
+        print(f"Auto-resolved raw ID column: {preferred_column!r} -> {fallback_column!r}")
+        return fallback_column
+    raise ValueError("SOURCE_QUERY returned no columns; unable to resolve raw ID column.")
+
+
+def _resolve_effective_raw_value_column(
+    preferred_column: str,
+    source_columns: list[str],
+    source_rows: list[dict[str, object]],
+    raw_id_column: str,
+) -> str:
+    if preferred_column in source_columns:
+        return preferred_column
+    candidate_match = _match_column_name(
+        source_columns,
+        [
+            "raw_value",
+            "value",
+            "name",
+            "note",
+            "description",
+            "title",
+            "supplier_name",
+            "text",
+        ],
+    )
+    if candidate_match is None:
+        candidate_match = _find_first_text_column(
+            source_rows=source_rows,
+            source_columns=source_columns,
+            excluded_columns={raw_id_column},
+        )
+    if candidate_match is not None:
+        print(f"Auto-resolved raw value column: {preferred_column!r} -> {candidate_match!r}")
+        return candidate_match
+    raise ValueError(
+        "Unable to resolve raw value column from SOURCE_QUERY result. "
+        "Set --raw-value-column explicitly or alias one text column as raw_value."
+    )
+
+
 def _resolve_categorize_column_names(
     arguments: argparse.Namespace,
     neutral: NeutralRuntimeConfig,
     apply_categorization: bool,
+    fallback_column: str,
 ) -> list[str]:
     if not apply_categorization:
         return []
@@ -242,7 +381,116 @@ def _resolve_categorize_column_names(
         return list(neutral.categorize_columns)
     return _parse_categorized_columns(
         arguments.categorized_columns,
-        fallback_column=arguments.raw_value_column,
+        fallback_column=fallback_column,
+    )
+
+
+_CATEGORIZE_SUGGEST_KEYWORDS: tuple[str, ...] = (
+    "raw_value",
+    "value",
+    "name",
+    "note",
+    "description",
+    "title",
+    "paket",
+    "penyedia",
+    "status",
+)
+
+
+def _source_column_has_non_empty_text(
+    source_rows: list[dict[str, object]],
+    column: str,
+) -> bool:
+    for source_row in source_rows:
+        value = source_row.get(column)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _suggest_categorize_columns(
+    source_columns: list[str],
+    source_rows: list[dict[str, object]],
+    id_column: str,
+    max_suggestions: int = 3,
+) -> list[str]:
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for column in source_columns:
+        if len(suggestions) >= max_suggestions:
+            break
+        if not _source_column_has_non_empty_text(source_rows, column):
+            continue
+        lowered = column.lower()
+        if any(keyword in lowered for keyword in _CATEGORIZE_SUGGEST_KEYWORDS):
+            suggestions.append(column)
+            seen.add(column)
+    for column in source_columns:
+        if len(suggestions) >= max_suggestions:
+            break
+        if column == id_column or column in seen:
+            continue
+        if not _source_column_has_non_empty_text(source_rows, column):
+            continue
+        suggestions.append(column)
+        seen.add(column)
+    return suggestions
+
+
+def _read_validated_categorize_column_names(
+    available_columns: list[str],
+    *,
+    default_line: str,
+) -> list[str]:
+    available: set[str] = set(available_columns)
+    while True:
+        raw = _prompt_text(
+            "Comma-separated source columns to categorize (append <col>_categorized in output)",
+            default_line,
+        )
+        names = [part.strip() for part in raw.split(",") if part.strip()]
+        if not names:
+            print("Error: at least one column is required.")
+            continue
+        unknown = sorted({name for name in names if name not in available})
+        if unknown:
+            available_text = ", ".join(available_columns)
+            print(
+                "Error: column name(s) not in SOURCE_QUERY result: "
+                f"{', '.join(unknown)}. "
+                f"Valid column names: {available_text}"
+            )
+            continue
+        return names
+
+
+def _prompt_interactive_categorize_column_selection(
+    source_columns: list[str],
+    source_rows: list[dict[str, object]],
+    id_column: str,
+) -> list[str]:
+    suggestions = _suggest_categorize_columns(
+        source_columns=source_columns,
+        source_rows=source_rows,
+        id_column=id_column,
+        max_suggestions=3,
+    )
+    print("Available columns from SOURCE_QUERY result:")
+    for name in source_columns:
+        print(f"  - {name}")
+    if suggestions:
+        print("Suggested columns to categorize:")
+        for name in suggestions:
+            print(f"  - {name}")
+    else:
+        print("No columns matched the suggestion heuristic (name keywords + first non-id text columns).")
+    if suggestions and _prompt_yes_no("Use suggested columns? (yes/no)"):
+        return list(suggestions)
+    default = ",".join(suggestions) if suggestions else ""
+    return _read_validated_categorize_column_names(
+        available_columns=source_columns,
+        default_line=default,
     )
 
 
@@ -253,6 +501,70 @@ def _resolve_llm_runtime(arguments: argparse.Namespace, neutral: NeutralRuntimeC
     llm_base_url = getattr(arguments, "llm_base_url", None) or neutral.llm_base_url
     llm_model = getattr(arguments, "llm_model", None) or neutral.llm_model
     return llm_api_key, llm_base_url, llm_model
+
+
+def _list_accessible_relations(reader: PostgresReader) -> list[str]:
+    relation_query = (
+        "SELECT table_schema, table_name "
+        "FROM information_schema.tables "
+        "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
+        "ORDER BY table_schema, table_name"
+    )
+    relation_rows, _ = reader.fetch_rows_and_columns_by_sql(relation_query)
+    relation_names: list[str] = []
+    for relation_row in relation_rows:
+        schema_name = relation_row.get("table_schema")
+        table_name = relation_row.get("table_name")
+        if isinstance(schema_name, str) and isinstance(table_name, str):
+            relation_names.append(f"{schema_name}.{table_name}")
+    return relation_names
+
+
+def _is_missing_relation_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "does not exist" in message and "relation" in message
+
+
+def _normalize_sql_spacing(sql_text: str) -> str:
+    normalized = sql_text
+    for keyword in ("FROM", "ORDER BY", "WHERE", "GROUP BY", "LIMIT", "JOIN"):
+        normalized = re.sub(rf"(?i)(\S)({keyword})\b", r"\1 \2", normalized)
+    return normalized
+
+
+def _fetch_source_rows_with_retry(
+    reader: PostgresReader,
+    *,
+    source_sql: str,
+    interactive_mode: bool,
+) -> tuple[list[dict[str, object]], list[str], str]:
+    current_source_sql = source_sql
+    while True:
+        try:
+            source_rows, source_columns = reader.fetch_rows_and_columns_by_sql(current_source_sql)
+            return source_rows, source_columns, current_source_sql
+        except Exception as error:
+            if interactive_mode and "syntax error at or near" in str(error).lower():
+                normalized_sql = _normalize_sql_spacing(current_source_sql)
+                if normalized_sql != current_source_sql:
+                    current_source_sql = normalized_sql
+                    continue
+            if not interactive_mode or not _is_missing_relation_error(error):
+                raise
+            print(f"Error: {error}")
+            relation_names = _list_accessible_relations(reader)
+            if relation_names:
+                print("Available tables/views:")
+                for relation_name in relation_names[:20]:
+                    print(f"- {relation_name}")
+                if len(relation_names) > 20:
+                    print(f"... and {len(relation_names) - 20} more")
+            else:
+                print("No accessible tables/views found in current database.")
+            current_source_sql = _prompt_text(
+                "SOURCE_QUERY / SQL (try one of the relations above)",
+                current_source_sql,
+            )
 
 
 def _run_api_check_mode(arguments: argparse.Namespace) -> int:
@@ -311,7 +623,7 @@ def _parse_manual_target_columns(target_columns_json: str) -> list[dict[str, Any
 
 
 def _parse_raw_columns(raw_columns: str | None, fallback_columns: list[str]) -> list[str]:
-    if raw_columns is None:
+    if raw_columns is None or not raw_columns.strip():
         return fallback_columns
     parsed_columns = [column.strip() for column in raw_columns.split(",") if column.strip()]
     if not parsed_columns:
@@ -343,8 +655,19 @@ def _ensure_required_columns(
         )
 
 
+def _find_missing_columns(
+    available_columns: list[str],
+    required_columns: list[str],
+) -> list[str]:
+    return sorted({column for column in required_columns if column not in set(available_columns)})
+
+
 def _serialize_categorized_labels(labels: list[str]) -> str:
     return json.dumps(labels, ensure_ascii=False)
+
+
+def _to_pretty_json(data: object) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
 def _ensure_http_sink() -> HttpApiSink:
@@ -466,46 +789,100 @@ def _run_query_first_to_api_flow(
     *,
     dry_run: bool,
     categorization_mode: bool,
+    interactive_mode: bool = False,
 ) -> int:
     neutral = load_neutral_runtime_config_from_env()
     database_url = _resolve_database_url(arguments, neutral)
     source_sql = _require_source_query(_resolve_source_query(arguments, neutral))
     apply_categorization = categorization_mode and neutral.do_categorize
-    categorize_column_names = _resolve_categorize_column_names(arguments, neutral, apply_categorization)
+    batch_size = _resolve_effective_batch_size(arguments, neutral)
+    source_row_limit = _resolve_source_row_limit(arguments, neutral)
+    preview_row_limit = _resolve_preview_row_limit(arguments, neutral)
+
+    reader = PostgresReader(database_url=database_url)
+    source_rows, source_columns, source_sql = _fetch_source_rows_with_retry(
+        reader,
+        source_sql=source_sql,
+        interactive_mode=interactive_mode,
+    )
+    limited_source_rows = source_rows[:source_row_limit]
+    effective_raw_id_column = _resolve_effective_raw_id_column(
+        preferred_column=arguments.raw_id_column,
+        source_columns=source_columns,
+        source_rows=limited_source_rows,
+    )
+    use_hybrid_categorize_column_selection = (
+        categorization_mode
+        and getattr(arguments, "mode", None) is None
+        and apply_categorization
+        and not neutral.categorize_columns
+        and arguments.categorized_columns is None
+    )
+    effective_raw_value_column: str | None = None
+    if apply_categorization and not neutral.categorize_columns and arguments.categorized_columns is None and not use_hybrid_categorize_column_selection:
+        effective_raw_value_column = _resolve_effective_raw_value_column(
+            preferred_column=arguments.raw_value_column,
+            source_columns=source_columns,
+            source_rows=limited_source_rows,
+            raw_id_column=effective_raw_id_column,
+        )
+    if use_hybrid_categorize_column_selection:
+        print()
+        categorize_column_names = _prompt_interactive_categorize_column_selection(
+            source_columns=source_columns,
+            source_rows=limited_source_rows,
+            id_column=effective_raw_id_column,
+        )
+    else:
+        categorize_column_names = _resolve_categorize_column_names(
+            arguments,
+            neutral,
+            apply_categorization,
+            fallback_column=effective_raw_value_column or arguments.raw_value_column,
+        )
+    if interactive_mode and apply_categorization:
+        missing_categorize_columns = _find_missing_columns(source_columns, categorize_column_names)
+        if missing_categorize_columns:
+            print(
+                "Configured categorize columns not found in SOURCE_QUERY result: "
+                f"{', '.join(missing_categorize_columns)}"
+            )
+            print("Switching to interactive categorized-column selection.")
+            categorize_column_names = _prompt_interactive_categorize_column_selection(
+                source_columns=source_columns,
+                source_rows=limited_source_rows,
+                id_column=effective_raw_id_column,
+            )
     if apply_categorization and not categorize_column_names:
         raise ValueError(
             "DO_CATEGORIZE=true requires at least one column: set CATEGORIZE_COLUMNS or --categorized-columns."
         )
-    batch_size = _resolve_effective_batch_size(arguments, neutral)
-
-    reader = PostgresReader(database_url=database_url)
     raw_columns = _parse_raw_columns(
         arguments.raw_columns,
-        fallback_columns=[arguments.raw_id_column, arguments.raw_value_column],
+        fallback_columns=list(source_columns),
     )
     selected_columns = list(raw_columns)
     for categorized_column in categorize_column_names:
         if categorized_column not in selected_columns:
             selected_columns.append(categorized_column)
 
-    source_rows, source_columns = reader.fetch_rows_and_columns_by_sql(source_sql)
     source_label = "SOURCE_QUERY result"
     if apply_categorization:
         _ensure_required_columns(
             available_columns=source_columns,
             required_columns=list(
-                dict.fromkeys(selected_columns + categorize_column_names + [arguments.raw_id_column])
+                dict.fromkeys(selected_columns + categorize_column_names + [effective_raw_id_column])
             ),
             source_label=source_label,
         )
     else:
         _ensure_required_columns(
             available_columns=source_columns,
-            required_columns=list(dict.fromkeys(raw_columns + [arguments.raw_id_column])),
+            required_columns=list(dict.fromkeys(raw_columns)),
             source_label=source_label,
         )
 
-    projected_selected = [{column: source_row[column] for column in selected_columns} for source_row in source_rows]
+    projected_selected = [{column: source_row[column] for column in selected_columns} for source_row in limited_source_rows]
     output_rows = [dict(row) for row in projected_selected]
 
     if apply_categorization:
@@ -554,19 +931,23 @@ def _run_query_first_to_api_flow(
                 "do_categorize": neutral.do_categorize,
                 "applied_categorization": apply_categorization,
                 "categorized_columns": categorize_column_names,
+                "source_row_limit": source_row_limit,
+                "preview_row_limit": preview_row_limit,
                 "total_input_rows": len(projected_selected),
                 "total_output_rows": len(output_rows),
-                "sample_records": output_rows[:3],
+                "sample_records": output_rows[:preview_row_limit],
             }
         else:
             dry_run_output = {
                 "flow": flow_name,
                 "dry_run": True,
                 "source_query": source_sql,
+                "source_row_limit": source_row_limit,
+                "preview_row_limit": preview_row_limit,
                 "total_rows": len(output_rows),
-                "sample_rows": output_rows[:3],
+                "sample_rows": output_rows[:preview_row_limit],
             }
-        print(json.dumps(dry_run_output, indent=2, ensure_ascii=False))
+        print(_to_pretty_json(dry_run_output))
         return 0
 
     load_result = _load_output_rows(output_rows)
@@ -579,8 +960,11 @@ def _run_query_first_to_api_flow(
             "do_categorize": neutral.do_categorize,
             "applied_categorization": apply_categorization,
             "categorized_columns": categorize_column_names,
+            "source_row_limit": source_row_limit,
+            "preview_row_limit": preview_row_limit,
             "total_input_rows": len(projected_selected),
             "total_output_rows": len(output_rows),
+            "sample_records": output_rows[:preview_row_limit],
             "load_result": _summarize_load_result(load_result),
         }
     else:
@@ -588,20 +972,32 @@ def _run_query_first_to_api_flow(
             "flow": flow_name,
             "dry_run": False,
             "source_query": source_sql,
+            "source_row_limit": source_row_limit,
+            "preview_row_limit": preview_row_limit,
             "total_rows": len(output_rows),
-            "sample_rows": output_rows[:3],
+            "sample_rows": output_rows[:preview_row_limit],
             "load_result": _summarize_load_result(load_result),
         }
-    print(json.dumps(success_output, indent=2, ensure_ascii=False))
+    print(_to_pretty_json(success_output))
     return 0
 
 
 def _run_raw_to_api_mode(arguments: argparse.Namespace, dry_run: bool) -> int:
-    return _run_query_first_to_api_flow(arguments=arguments, dry_run=dry_run, categorization_mode=False)
+    return _run_query_first_to_api_flow(
+        arguments=arguments,
+        dry_run=dry_run,
+        categorization_mode=False,
+        interactive_mode=bool(getattr(arguments, "interactive_mode", False)),
+    )
 
 
 def _run_categorize_to_api_mode(arguments: argparse.Namespace, dry_run: bool) -> int:
-    return _run_query_first_to_api_flow(arguments=arguments, dry_run=dry_run, categorization_mode=True)
+    return _run_query_first_to_api_flow(
+        arguments=arguments,
+        dry_run=dry_run,
+        categorization_mode=True,
+        interactive_mode=bool(getattr(arguments, "interactive_mode", False)),
+    )
 
 
 def _run_categorization_only_mode(arguments: argparse.Namespace) -> int:
@@ -674,6 +1070,7 @@ def main() -> int:
     selected_mode = _normalize_mode(arguments.mode or _prompt_mode())
 
     if arguments.mode is None:
+        setattr(arguments, "interactive_mode", True)
         if selected_mode == "api_check":
             arguments.api_check_mode = _prompt_text("API check mode (me/account/datasets)", arguments.api_check_mode)
             if arguments.api_check_mode not in {"me", "account", "datasets"}:
@@ -681,6 +1078,8 @@ def main() -> int:
             return _run_api_check_mode(arguments)
         if selected_mode in {"raw_to_api", "categorize_to_api"}:
             _configure_interactive_query_first_mode(arguments, selected_mode)
+    else:
+        setattr(arguments, "interactive_mode", False)
 
     if selected_mode == "api_check":
         return _run_api_check_mode(arguments)

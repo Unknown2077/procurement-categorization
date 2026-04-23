@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime
 from decimal import Decimal
+from uuid import UUID
 from urllib import error, request
 
 from column_categorization.schemas.categorization import CategorizedRecord
@@ -24,7 +26,8 @@ class HttpApiSink:
         return self.load_rows(rows=payload["rows"])
 
     def load_rows(self, rows: list[dict[str, object]]) -> LoadResult:
-        payload = {"rows": rows}
+        normalized_rows = [_normalize_row_keys(row) for row in rows]
+        payload = {"rows": normalized_rows}
         response_status = self._post_payload(payload)
         if response_status < 200 or response_status >= 300:
             failure = LoadFailure(
@@ -74,4 +77,25 @@ def _to_json_safe(value: object) -> object:
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)
+    if isinstance(value, UUID):
+        return str(value)
     return value
+
+
+def _normalize_row_keys(row: dict[str, object]) -> dict[str, object]:
+    normalized_row: dict[str, object] = {}
+    for key, value in row.items():
+        normalized_key = _normalize_column_name(str(key))
+        normalized_row[normalized_key] = value
+    return normalized_row
+
+
+def _normalize_column_name(value: str) -> str:
+    lowered = value.strip().lower()
+    replaced = re.sub(r"[^a-z0-9]+", "_", lowered)
+    collapsed = re.sub(r"_+", "_", replaced).strip("_")
+    if not collapsed:
+        return "column"
+    if collapsed[0].isdigit():
+        return f"col_{collapsed}"
+    return collapsed

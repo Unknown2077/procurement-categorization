@@ -6,6 +6,7 @@ from pathlib import Path
 
 from column_categorization.schemas.categorization import CategorizedRecord
 from column_categorization.schemas.load import LoadResult
+from column_categorization.sinks.http_api_sink import _to_json_safe
 
 
 class FileSink:
@@ -38,7 +39,7 @@ class FileSink:
             raise ValueError("load_rows currently supports jsonl output only")
         with self._output_path.open("a", encoding="utf-8") as output_file:
             for row in rows:
-                output_file.write(f"{json.dumps(row, ensure_ascii=False)}\n")
+                output_file.write(f"{json.dumps(_to_json_safe(row), ensure_ascii=False)}\n")
         return LoadResult(
             sink_type="file",
             total_records=len(rows),
