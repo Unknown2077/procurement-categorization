@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import main
+from column_categorization import cli_categorize_only
+from column_categorization import cli_query_first
 from column_categorization.schemas.categorization import CategorizationResponse, SourceInfo
 from column_categorization.schemas.load import LoadResult
 
@@ -26,6 +27,8 @@ def _base_arguments() -> argparse.Namespace:
     return argparse.Namespace(
         database_url=None,
         source_sql=None,
+        source_row_limit=None,
+        preview_row_limit=None,
         raw_columns="source_event_id,raw_value",
         raw_id_column="source_event_id",
         raw_value_column="raw_value",
@@ -45,9 +48,9 @@ def test_categorize_mode_respects_do_categorize_false(monkeypatch: pytest.Monkey
         [{"source_event_id": 1, "raw_value": "alpha"}],
         ["source_event_id", "raw_value"],
     )
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "OpenAILLMCategorizer") as categorizer_cls:
-            exit_code = main._run_query_first_to_api_flow(
+    with patch.object(cli_query_first, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_query_first, "OpenAILLMCategorizer") as categorizer_cls:
+            exit_code = cli_query_first._run_query_first_to_api_flow(
                 _base_arguments(),
                 dry_run=True,
                 categorization_mode=True,
@@ -73,9 +76,9 @@ def test_categorize_mode_with_do_categorize_true_builds_categorizer(monkeypatch:
         column_description="",
         mappings=[ValueMapping(raw_value="alpha", labels=["L1"])],
     )
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "OpenAILLMCategorizer", return_value=mock_categorizer):
-            exit_code = main._run_query_first_to_api_flow(
+    with patch.object(cli_query_first, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_query_first, "OpenAILLMCategorizer", return_value=mock_categorizer):
+            exit_code = cli_query_first._run_query_first_to_api_flow(
                 _base_arguments(),
                 dry_run=True,
                 categorization_mode=True,
@@ -97,11 +100,11 @@ def test_categorization_fail_fast_skips_sink_load(monkeypatch: pytest.MonkeyPatc
     mock_categorizer = MagicMock()
     mock_categorizer.categorize_batch.side_effect = ValueError("llm failure")
     sink = MagicMock()
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "OpenAILLMCategorizer", return_value=mock_categorizer):
-            with patch.object(main, "_ensure_http_sink", return_value=sink):
+    with patch.object(cli_query_first, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_query_first, "OpenAILLMCategorizer", return_value=mock_categorizer):
+            with patch.object(cli_query_first, "_ensure_http_sink", return_value=sink):
                 with pytest.raises(RuntimeError, match="Categorization failed"):
-                    main._run_query_first_to_api_flow(
+                    cli_query_first._run_query_first_to_api_flow(
                         _base_arguments(),
                         dry_run=False,
                         categorization_mode=True,
@@ -126,9 +129,9 @@ def test_raw_mode_with_json_target_uses_file_sink_loader(monkeypatch: pytest.Mon
         failed_records=0,
         failures=[],
     )
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "_ensure_file_sink", return_value=file_sink):
-            exit_code = main._run_query_first_to_api_flow(
+    with patch.object(cli_query_first, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_query_first, "_ensure_file_sink", return_value=file_sink):
+            exit_code = cli_query_first._run_query_first_to_api_flow(
                 _base_arguments(),
                 dry_run=False,
                 categorization_mode=False,
@@ -155,10 +158,10 @@ def test_categorize_only_uses_query_first_request(monkeypatch: pytest.MonkeyPatc
         columns=[],
         errors=[],
     )
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "OpenAILLMCategorizer", return_value=MagicMock()):
-            with patch.object(main, "ColumnCategorizationPipeline", return_value=pipeline_instance):
-                exit_code = main._run_categorization_only_mode(arguments)
+    with patch.object(cli_categorize_only, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_categorize_only, "OpenAILLMCategorizer", return_value=MagicMock()):
+            with patch.object(cli_categorize_only, "ColumnCategorizationPipeline", return_value=pipeline_instance):
+                exit_code = cli_categorize_only._run_categorization_only_mode(arguments)
     assert exit_code == 0
     call_args = pipeline_instance.run.call_args
     request = call_args.args[0]
@@ -175,10 +178,10 @@ def test_nullable_mismatch_error_message_is_preserved(monkeypatch: pytest.Monkey
     )
     sink = MagicMock()
     sink.load_rows.side_effect = ValueError("null value in column \"raw_value\" violates not-null constraint")
-    with patch.object(main, "PostgresReader", return_value=reader_instance):
-        with patch.object(main, "_ensure_http_sink", return_value=sink):
+    with patch.object(cli_query_first, "PostgresReader", return_value=reader_instance):
+        with patch.object(cli_query_first, "_ensure_http_sink", return_value=sink):
             with pytest.raises(RuntimeError, match="null value in column"):
-                main._run_query_first_to_api_flow(
+                cli_query_first._run_query_first_to_api_flow(
                     _base_arguments(),
                     dry_run=False,
                     categorization_mode=False,

@@ -18,12 +18,13 @@ Set `DB_URL` and adjust `SOURCE_QUERY` for your data. Defaults in [.env.example]
 .venv/bin/python main.py
 ```
 
-1. Choose `1` **to_api** (unified flow) or `2` **categorize_only** for categorization output only.
-2. In `to_api`, app checks `DO_CATEGORIZE` from `.env`: when empty it asks interactively whether categorization should run.
-3. Press Enter to use `SOURCE_QUERY` from `.env`, or paste different SQL.
-4. **Dry run (yes/no)** (interactive prompt; non-interactive: `--dry-run`):
+1. Choose `1` **to_api** (unified flow) or `2` **categorize_only** for categorization output only, or `3` **api_check**.
+2. Press Enter to use `SOURCE_QUERY` from `.env`, or paste different SQL.
+3. In **to_api** only: **Dry run (yes/no)** (non-interactive: `--dry-run`):
    - **yes**: prints JSON preview only; nothing is written to the target.
    - **no**: `TARGET_TYPE=json` appends to `TARGET_OUTPUT_PATH`; `TARGET_TYPE=api` sends rows to the API (requires target credentials).
+4. In **to_api** only: you are always asked **Apply categorization? (yes/no)**. `DO_CATEGORIZE` in `.env` is only the default (blank default is *no*).
+5. A short **execution preview** and **Proceed with this configuration? (yes/no)**. Answering *no* exits with code 0 and a cancellation message.
 
 ## CLI (non-interactive)
 
