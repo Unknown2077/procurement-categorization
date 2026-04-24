@@ -40,7 +40,13 @@ def _neutral_runtime(
 
 def test_normalize_mode_maps_legacy_etl_alias() -> None:
     assert main._normalize_mode("etl") == "categorize_to_api"
+    assert main._normalize_mode("to_api") == "to_api"
     assert main._normalize_mode("raw_to_api") == "raw_to_api"
+
+
+def test_parse_bool_text_parses_true_and_false() -> None:
+    assert main._parse_bool_text("yes", "DO_CATEGORIZE") is True
+    assert main._parse_bool_text("off", "DO_CATEGORIZE") is False
 
 
 def test_parse_raw_columns_uses_fallback() -> None:
@@ -114,15 +120,44 @@ def test_resolve_effective_batch_size_falls_back_to_neutral() -> None:
 def test_resolve_categorize_column_names_reads_neutral_csv_when_flagged() -> None:
     arguments = argparse.Namespace(categorized_columns=None, raw_value_column="raw_value")
     neutral = _neutral_runtime(source_query="SELECT 1", do_categorize=True, categorize_columns=("a", "b"))
-    output = main._resolve_categorize_column_names(arguments, neutral, apply_categorization=True)
+    output = main._resolve_categorize_column_names(
+        arguments,
+        neutral,
+        apply_categorization=True,
+        fallback_column="raw_value",
+    )
     assert output == ["a", "b"]
 
 
 def test_resolve_categorize_column_names_falls_back_to_cli_when_neutral_empty() -> None:
     arguments = argparse.Namespace(categorized_columns="x, y", raw_value_column="raw_value")
     neutral = _neutral_runtime(source_query="SELECT 1", do_categorize=True, categorize_columns=())
-    output = main._resolve_categorize_column_names(arguments, neutral, apply_categorization=True)
+    output = main._resolve_categorize_column_names(
+        arguments,
+        neutral,
+        apply_categorization=True,
+        fallback_column="raw_value",
+    )
     assert output == ["x", "y"]
+
+
+def test_fetch_source_rows_with_retry_lists_relations_and_reprompts() -> None:
+    reader = MagicMock()
+    reader.fetch_rows_and_columns_by_sql.side_effect = [
+        ValueError('relation "public.missing_table" does not exist'),
+        ([{"id": 1, "description": "ok"}], ["id", "description"]),
+    ]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(main, "_list_accessible_relations", lambda _: ["public.demo_table"])
+        monkeypatch.setattr(main, "_prompt_text", lambda *_args, **_kwargs: "SELECT id, description FROM public.demo_table")
+        rows, columns, resolved_sql = main._fetch_source_rows_with_retry(
+            reader=reader,  # type: ignore[arg-type]
+            source_sql="SELECT id, description FROM public.missing_table",
+            interactive_mode=True,
+        )
+    assert rows == [{"id": 1, "description": "ok"}]
+    assert columns == ["id", "description"]
+    assert resolved_sql == "SELECT id, description FROM public.demo_table"
 
 
 def test_resolve_llm_runtime_prefers_cli_over_neutral() -> None:

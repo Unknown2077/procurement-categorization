@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import main
+from column_categorization.schemas.categorization import CategorizationResponse, SourceInfo
 from column_categorization.schemas.load import LoadResult
 
 
@@ -135,3 +136,50 @@ def test_raw_mode_with_json_target_uses_file_sink_loader(monkeypatch: pytest.Mon
     assert exit_code == 0
     file_sink.reset_output.assert_called_once()
     file_sink.load_rows.assert_called_once()
+
+
+def test_categorize_only_uses_query_first_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_minimal_neutral_env(monkeypatch)
+    monkeypatch.setenv("DO_CATEGORIZE", "true")
+    monkeypatch.setenv("CATEGORIZE_COLUMNS", "raw_value")
+    reader_instance = MagicMock()
+    reader_instance.fetch_rows_and_columns_by_sql.return_value = (
+        [{"source_event_id": 1, "raw_value": "alpha"}],
+        ["source_event_id", "raw_value"],
+    )
+    arguments = _base_arguments()
+    arguments.target_columns_json = None
+    pipeline_instance = MagicMock()
+    pipeline_instance.run.return_value = CategorizationResponse(
+        source=SourceInfo(database="db", schema_name="query", table="SOURCE_QUERY"),
+        columns=[],
+        errors=[],
+    )
+    with patch.object(main, "PostgresReader", return_value=reader_instance):
+        with patch.object(main, "OpenAILLMCategorizer", return_value=MagicMock()):
+            with patch.object(main, "ColumnCategorizationPipeline", return_value=pipeline_instance):
+                exit_code = main._run_categorization_only_mode(arguments)
+    assert exit_code == 0
+    call_args = pipeline_instance.run.call_args
+    request = call_args.args[0]
+    assert request.source_query == "SELECT 1 AS source_event_id, 'v' AS raw_value"
+
+
+def test_nullable_mismatch_error_message_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_minimal_neutral_env(monkeypatch)
+    monkeypatch.setenv("LOAD_MAX_RETRIES", "0")
+    reader_instance = MagicMock()
+    reader_instance.fetch_rows_and_columns_by_sql.return_value = (
+        [{"source_event_id": 1, "raw_value": None}],
+        ["source_event_id", "raw_value"],
+    )
+    sink = MagicMock()
+    sink.load_rows.side_effect = ValueError("null value in column \"raw_value\" violates not-null constraint")
+    with patch.object(main, "PostgresReader", return_value=reader_instance):
+        with patch.object(main, "_ensure_http_sink", return_value=sink):
+            with pytest.raises(RuntimeError, match="null value in column"):
+                main._run_query_first_to_api_flow(
+                    _base_arguments(),
+                    dry_run=False,
+                    categorization_mode=False,
+                )

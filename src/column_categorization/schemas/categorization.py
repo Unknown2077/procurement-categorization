@@ -20,6 +20,10 @@ class CategorizationRequest(BaseModel):
     batch_size: int = Field(default=100, ge=1, le=1000)
     schema_name: str = Field(default="public", min_length=1)
     table_name: str = Field(default="original_data", min_length=1)
+    source_query: str | None = Field(default=None, min_length=1)
+    source_row_limit: int | None = Field(default=None, ge=1)
+    prefetched_query_rows: list[dict[str, object]] | None = None
+    prefetched_query_columns: list[str] | None = None
 
     @model_validator(mode="after")
     def validate_unique_column_names(self) -> "CategorizationRequest":
@@ -29,6 +33,14 @@ class CategorizationRequest(BaseModel):
             if normalized_name in seen_columns:
                 raise ValueError(f"Duplicate target column name: {target_column.name}")
             seen_columns.add(normalized_name)
+        return self
+
+    @model_validator(mode="after")
+    def validate_prefetch_consistency(self) -> "CategorizationRequest":
+        rows_set = self.prefetched_query_rows is not None
+        columns_set = self.prefetched_query_columns is not None
+        if rows_set != columns_set:
+            raise ValueError("prefetched_query_rows and prefetched_query_columns must be set together or both omitted")
         return self
 
 

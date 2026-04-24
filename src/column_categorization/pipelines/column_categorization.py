@@ -28,26 +28,74 @@ def _build_source_info(database_url: str, schema_name: str, table_name: str) -> 
     return SourceInfo(database=parsed_url.path.removeprefix("/"), schema_name=schema_name, table=table_name)
 
 
+def _build_query_source_info(database_url: str) -> SourceInfo:
+    return _build_source_info(database_url=database_url, schema_name="query", table_name="SOURCE_QUERY")
+
+
+def _distinct_string_values_from_rows(
+    rows: list[dict[str, object]],
+    column_name: str,
+) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for row in rows:
+        value = row.get(column_name)
+        if not isinstance(value, str):
+            continue
+        trimmed = value.strip()
+        if not trimmed or trimmed in seen:
+            continue
+        seen.add(trimmed)
+        ordered.append(trimmed)
+    ordered.sort()
+    return ordered
+
+
 class ColumnCategorizationPipeline:
     def __init__(self, reader: PostgresReader, categorizer: BatchCategorizer) -> None:
         self._reader = reader
         self._categorizer = categorizer
 
     def run(self, request: CategorizationRequest) -> CategorizationResponse:
-        source = _build_source_info(
-            database_url=request.database_url,
-            schema_name=request.schema_name,
-            table_name=request.table_name,
-        )
+        query_mode = request.source_query is not None and request.source_query.strip() != ""
+        if query_mode:
+            source = _build_query_source_info(database_url=request.database_url)
+            if request.prefetched_query_rows is not None and request.prefetched_query_columns is not None:
+                source_rows = list(request.prefetched_query_rows)
+                source_columns = list(request.prefetched_query_columns)
+            else:
+                source_rows, source_columns = self._reader.fetch_rows_and_columns_by_sql(request.source_query.strip())
+                if request.source_row_limit is not None:
+                    source_rows = source_rows[: request.source_row_limit]
+            available = set(source_columns)
+            for target_column in request.target_columns:
+                if target_column.name not in available:
+                    valid_names = ", ".join(source_columns)
+                    raise ValueError(
+                        f"Column {target_column.name!r} not found in SOURCE_QUERY result. "
+                        f"Valid column names: {valid_names}"
+                    )
+        else:
+            source = _build_source_info(
+                database_url=request.database_url,
+                schema_name=request.schema_name,
+                table_name=request.table_name,
+            )
         columns: list[ColumnCategorizationResult] = []
         errors: list[PipelineError] = []
 
         for target_column in request.target_columns:
-            raw_values = self._reader.fetch_distinct_values(
-                schema_name=request.schema_name,
-                table_name=request.table_name,
-                column_name=target_column.name,
-            )
+            if query_mode:
+                raw_values = _distinct_string_values_from_rows(
+                    rows=source_rows,
+                    column_name=target_column.name,
+                )
+            else:
+                raw_values = self._reader.fetch_distinct_values(
+                    schema_name=request.schema_name,
+                    table_name=request.table_name,
+                    column_name=target_column.name,
+                )
             batch_summaries: list[BatchSummary] = []
             merged_mappings: dict[str, ValueMapping] = {}
             resolved_column_description: str | None = None

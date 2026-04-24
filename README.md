@@ -1,11 +1,8 @@
 # Vendor-Agnostic ETL Categorization
 
-Simple ETL runner:
-- Read rows from PostgreSQL using one SQL query
-- Optional LLM categorization
-- Load to API (`TARGET_TYPE=api`) or JSONL file (`TARGET_TYPE=json`)
+Query-first ETL: run one PostgreSQL `SELECT`, optionally categorize with an LLM, then write JSONL (`TARGET_TYPE=json`) or POST to an API (`TARGET_TYPE=api`).
 
-## Quick Start
+## Quick start
 
 ```bash
 python -m venv .venv
@@ -13,78 +10,51 @@ python -m venv .venv
 cp .env.example .env
 ```
 
-Set minimal `.env`:
+Set `DB_URL` and adjust `SOURCE_QUERY` for your data. Defaults in [.env.example](.env.example) are demo-safe: `TARGET_TYPE=json`, `DO_CATEGORIZE=false`, and a generic in-memory `SELECT` (no vendor schema).
 
-```env
-DB_URL=postgresql://user:pass@127.0.0.1:5432/db_name
-SOURCE_QUERY=SELECT * FROM public.my_view
-SOURCE_ROW_LIMIT=50
-PREVIEW_ROW_LIMIT=10
+## Interactive (recommended)
 
-TARGET_TYPE=json
-TARGET_OUTPUT_PATH=outputs/categorized_preview.jsonl
-
-DO_CATEGORIZE=false
-LLM_MODEL=qwen/qwen3-next-80b-a3b-instruct
-LLM_API_KEY=replace_me
-```
-
-## How To Run
-
-Interactive (recommended):
 ```bash
 .venv/bin/python main.py
 ```
 
-In interactive mode:
-1. Choose `2` for `raw_to_api` (or `1` for `categorize_to_api`)
-2. Press Enter to use `SOURCE_QUERY` from `.env` (or type custom SQL)
-3. Choose `yes` for dry-run (safe preview), `no` for real load
+1. Choose `1` **to_api** (unified flow) or `2` **categorize_only** for categorization output only.
+2. In `to_api`, app checks `DO_CATEGORIZE` from `.env`: when empty it asks interactively whether categorization should run.
+3. Press Enter to use `SOURCE_QUERY` from `.env`, or paste different SQL.
+4. **Dry run (yes/no)** (interactive prompt; non-interactive: `--dry-run`):
+   - **yes**: prints JSON preview only; nothing is written to the target.
+   - **no**: `TARGET_TYPE=json` appends to `TARGET_OUTPUT_PATH`; `TARGET_TYPE=api` sends rows to the API (requires target credentials).
 
-## Most Used Commands
+## CLI (non-interactive)
 
-Raw preview (safe):
+Dry-run (preview only):
+
 ```bash
 .venv/bin/python main.py --mode raw_to_api --dry-run
 ```
 
-Raw real load:
+Write to the configured target:
+
 ```bash
 .venv/bin/python main.py --mode raw_to_api
 ```
 
-Categorize + load:
+Categorize then load (`--mode categorize_to_api`; `--mode etl` is the same). Use `--dry-run` for preview only.
+
 ```bash
+.venv/bin/python main.py --mode categorize_to_api --dry-run
 .venv/bin/python main.py --mode categorize_to_api
 ```
 
-Custom SQL one-off:
-```bash
-.venv/bin/python main.py --mode raw_to_api --source-sql "SELECT * FROM public.my_view"
-```
+Useful flags: `--source-sql`, `--source-row-limit`, `--preview-row-limit`, `--database-url` (override `DB_URL`). See `main.py --help`.
+Dry-run now saves full output JSON into `outputs/` and prints only preview + `dry_run_output_path` in terminal. Override file path with `--dry-run-output-path`.
 
-## Key Env Variables
+## Advanced
 
-- `DB_URL`: PostgreSQL connection string
-- `SOURCE_QUERY`: SQL for source extraction
-- `SOURCE_ROW_LIMIT`: max rows processed (default 10)
-- `PREVIEW_ROW_LIMIT`: max rows shown in terminal JSON (default 10)
-- `TARGET_TYPE`: `json` or `api`
-- `TARGET_OUTPUT_PATH`: required for `TARGET_TYPE=json`
-- `TARGET_API_BASE_URL`, `TARGET_ACCOUNT_UID`, `TARGET_DATASET_UID`, `TARGET_ACCESS_TOKEN`: required for `TARGET_TYPE=api`
-- `DO_CATEGORIZE`: `true`/`false`
-- `CATEGORIZE_COLUMNS`: optional columns to categorize
+- **Custom SQL**: `--source-sql "SELECT ..."` overrides `SOURCE_QUERY`. Any valid PostgreSQL works (CTEs, subqueries, casts, column aliases).
+- **Env reference**: comments in `.env.example` list `DB_URL`, row limits, `TARGET_TYPE`, API/JSON paths, `DO_CATEGORIZE`, `CATEGORIZE_COLUMNS`, LLM settings, and api_check paths.
+- **Output**: dry-run never loads; a real run still prints a JSON summary. API loads can fail if column types/nullability do not match the destination dataset.
+- **Interactive recovery**: if the relation in your SQL is wrong, the app may list available relations and ask again.
+- **`--raw-columns`**: when set, restricts which columns are read from the source row set; if omitted, all columns returned by the query are used.
 
-## Output Behavior (Important)
-
-- `dry-run=yes`: prints JSON preview to terminal, does **not** load to target.
-- `dry-run=no`:
-  - `TARGET_TYPE=json`: writes rows to `TARGET_OUTPUT_PATH`.
-  - `TARGET_TYPE=api`: sends rows to API.
-  - both still print JSON summary to terminal.
-
-## Notes
-
-- If query relation/table is wrong in interactive mode, the app shows available relations and asks for query again.
-- If `--raw-columns` is omitted, the app uses all columns returned by the query.
-- API target may reject rows if schema/types/nullability do not match destination dataset.
+Other `--mode` values: `manual` (sub-menu), `api_check` (GET smoke checks; separate flags `--api-check-mode`, `--api-token`, etc.).

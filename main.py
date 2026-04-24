@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 from column_categorization.categorization.llm_categorizer import (
@@ -32,7 +33,7 @@ from column_categorization.db.postgres_reader import PostgresReader
 from column_categorization.pipelines.column_categorization import (
     ColumnCategorizationPipeline,
 )
-from column_categorization.schemas.categorization import CategorizationRequest
+from column_categorization.schemas.categorization import CategorizationRequest, TargetColumn
 from column_categorization.schemas.load import LoadFailure, LoadResult
 from column_categorization.sinks.file_sink import FileSink
 from column_categorization.sinks.http_api_sink import HttpApiSink
@@ -60,9 +61,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive multi-flow runner")
     parser.add_argument(
         "--mode",
-        choices=["raw_to_api", "categorize_to_api", "manual", "etl", "api_check"],
+        choices=[
+            "to_api",
+            "raw_to_api",
+            "categorize_to_api",
+            "categorize_only",
+            "manual",
+            "etl",
+            "api_check",
+        ],
         default=None,
-        help="raw_to_api, categorize_to_api, manual, api_check, or etl (alias for categorize_to_api)",
+        help="to_api, raw_to_api, categorize_to_api, categorize_only, manual, api_check, or etl (alias for categorize_to_api)",
     )
     parser.add_argument(
         "--database-url",
@@ -118,6 +127,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Prepare and preview payload without sending to API",
     )
+    parser.add_argument(
+        "--dry-run-output-path",
+        default=None,
+        help="Optional JSON file path for full dry-run output (defaults to outputs/dry_run_<flow>_<timestamp>.json)",
+    )
 
     parser.add_argument(
         "--target-columns-json",
@@ -161,18 +175,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _prompt_mode() -> str:
     print("Select flow:")
-    print("1) categorize_to_api (recommended)")
-    print("2) raw_to_api")
-    print("3) categorize_only")
-    print("4) api_check")
-    selected = input("Enter choice [1/2/3/4] (default 1): ").strip()
+    print("1) to_api (recommended)")
+    print("2) categorize_only")
+    print("3) api_check")
+    selected = input("Enter choice [1/2/3] (default 1): ").strip()
     if selected == "2":
-        return "raw_to_api"
-    if selected == "3":
         return "categorize_only"
-    if selected == "4":
+    if selected == "3":
         return "api_check"
-    return "categorize_to_api"
+    return "to_api"
 
 
 def _prompt_yes_no(label: str, default_yes: bool = True) -> bool:
@@ -180,22 +191,39 @@ def _prompt_yes_no(label: str, default_yes: bool = True) -> bool:
     return _prompt_text(label, default_value).lower() == "yes"
 
 
-def _default_raw_to_api_test_query() -> str:
-    return "SELECT * FROM external_vendor.vw_procurement_source ORDER BY source_event_id"
+def _interactive_acquire_source_sql(arguments: argparse.Namespace, neutral: NeutralRuntimeConfig) -> str:
+    resolved = (_resolve_source_query(arguments, neutral) or "").strip()
+    if resolved:
+        prompted = _prompt_text(
+            "SOURCE_QUERY / SQL (blank keeps default from .env or prior entry)",
+            resolved,
+        ).strip()
+        return prompted or resolved
+    database_url = _resolve_database_url(arguments, neutral)
+    reader = PostgresReader(database_url=database_url)
+    relation_names = _list_accessible_relations(reader)
+    print("No SOURCE_QUERY in .env or CLI. Enter a SELECT that returns the columns you need.")
+    if relation_names:
+        print("Available tables/views (schema.table):")
+        for relation_name in relation_names[:20]:
+            print(f"  - {relation_name}")
+        if len(relation_names) > 20:
+            print(f"  ... and {len(relation_names) - 20} more")
+    else:
+        print("No accessible tables/views listed for this database user.")
+    while True:
+        entered = input("SOURCE_QUERY / SQL (required): ").strip()
+        if entered:
+            return entered
+        print("Error: SOURCE_QUERY cannot be empty.")
 
 
 def _configure_interactive_query_first_mode(arguments: argparse.Namespace, selected_mode: str) -> None:
     neutral = load_neutral_runtime_config_from_env()
-    resolved_source_sql = _resolve_source_query(arguments, neutral)
-    default_source_sql = (resolved_source_sql or "").strip()
-    if not default_source_sql and selected_mode == "raw_to_api":
-        default_source_sql = _default_raw_to_api_test_query()
-    arguments.source_sql = _prompt_text(
-        "SOURCE_QUERY / SQL (blank uses SOURCE_QUERY from .env)",
-        default_source_sql,
-    )
-    arguments.dry_run = _prompt_yes_no("Dry run (yes/no)", default_yes=True)
-    print(f"Dry run: {'enabled' if arguments.dry_run else 'disabled'} (no API load when enabled)")
+    arguments.source_sql = _interactive_acquire_source_sql(arguments, neutral)
+    if selected_mode in {"to_api", "raw_to_api", "categorize_to_api"}:
+        arguments.dry_run = _prompt_yes_no("Dry run (yes/no)", default_yes=True)
+        print(f"Dry run: {'enabled' if arguments.dry_run else 'disabled'} (no API load when enabled)")
 
 
 def _prompt_text(label: str, default_value: str) -> str:
@@ -204,7 +232,25 @@ def _prompt_text(label: str, default_value: str) -> str:
 
 
 def _normalize_mode(value: str) -> str:
-    return "categorize_to_api" if value == "etl" else value
+    if value == "etl":
+        return "categorize_to_api"
+    return value
+
+
+def _parse_bool_text(value: str, label: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{label} must be a boolean, got '{value}'")
+
+
+def _resolve_interactive_to_api_do_categorize() -> bool:
+    raw_value = os.environ.get("DO_CATEGORIZE")
+    if raw_value is None or not raw_value.strip():
+        return _prompt_yes_no("Apply categorization? (yes/no)", default_yes=False)
+    return _parse_bool_text(raw_value, "DO_CATEGORIZE")
 
 
 def _resolve_database_url(arguments: argparse.Namespace, neutral: NeutralRuntimeConfig) -> str:
@@ -670,6 +716,25 @@ def _to_pretty_json(data: object) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
+def _resolve_dry_run_output_path(arguments: argparse.Namespace, flow_name: str) -> str:
+    cli_path = getattr(arguments, "dry_run_output_path", None)
+    if isinstance(cli_path, str) and cli_path.strip():
+        return cli_path.strip()
+    env_path = os.environ.get("DRY_RUN_OUTPUT_PATH")
+    if env_path is not None and env_path.strip():
+        return env_path.strip()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"outputs/dry_run_{flow_name}_{timestamp}.json"
+
+
+def _write_json_file(path: str, payload: object) -> None:
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, indent=2, ensure_ascii=False, default=str)
+
+
 def _ensure_http_sink() -> HttpApiSink:
     sink_config = load_sink_config_from_env()
     if sink_config.sink_type != "http":
@@ -789,12 +854,14 @@ def _run_query_first_to_api_flow(
     *,
     dry_run: bool,
     categorization_mode: bool,
+    force_do_categorize: bool | None = None,
     interactive_mode: bool = False,
 ) -> int:
     neutral = load_neutral_runtime_config_from_env()
     database_url = _resolve_database_url(arguments, neutral)
     source_sql = _require_source_query(_resolve_source_query(arguments, neutral))
-    apply_categorization = categorization_mode and neutral.do_categorize
+    effective_do_categorize = neutral.do_categorize if force_do_categorize is None else force_do_categorize
+    apply_categorization = categorization_mode and effective_do_categorize
     batch_size = _resolve_effective_batch_size(arguments, neutral)
     source_row_limit = _resolve_source_row_limit(arguments, neutral)
     preview_row_limit = _resolve_preview_row_limit(arguments, neutral)
@@ -840,19 +907,26 @@ def _run_query_first_to_api_flow(
             apply_categorization,
             fallback_column=effective_raw_value_column or arguments.raw_value_column,
         )
-    if interactive_mode and apply_categorization:
+    if apply_categorization:
         missing_categorize_columns = _find_missing_columns(source_columns, categorize_column_names)
         if missing_categorize_columns:
-            print(
-                "Configured categorize columns not found in SOURCE_QUERY result: "
-                f"{', '.join(missing_categorize_columns)}"
-            )
-            print("Switching to interactive categorized-column selection.")
-            categorize_column_names = _prompt_interactive_categorize_column_selection(
-                source_columns=source_columns,
-                source_rows=limited_source_rows,
-                id_column=effective_raw_id_column,
-            )
+            if interactive_mode:
+                print(
+                    "Configured categorize columns not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing_categorize_columns)}"
+                )
+                print("Switching to interactive categorized-column selection.")
+                categorize_column_names = _prompt_interactive_categorize_column_selection(
+                    source_columns=source_columns,
+                    source_rows=limited_source_rows,
+                    id_column=effective_raw_id_column,
+                )
+            else:
+                available_text = ", ".join(source_columns)
+                raise ValueError(
+                    "Column(s) not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing_categorize_columns)}. Valid column names: {available_text}"
+                )
     if apply_categorization and not categorize_column_names:
         raise ValueError(
             "DO_CATEGORIZE=true requires at least one column: set CATEGORIZE_COLUMNS or --categorized-columns."
@@ -923,12 +997,13 @@ def _run_query_first_to_api_flow(
     flow_name = "categorize_to_api" if categorization_mode else "raw_to_api"
 
     if dry_run:
+        dry_run_output_path = _resolve_dry_run_output_path(arguments, flow_name)
         if categorization_mode:
             dry_run_output: dict[str, Any] = {
                 "flow": flow_name,
                 "dry_run": True,
                 "source_query": source_sql,
-                "do_categorize": neutral.do_categorize,
+                "do_categorize": effective_do_categorize,
                 "applied_categorization": apply_categorization,
                 "categorized_columns": categorize_column_names,
                 "source_row_limit": source_row_limit,
@@ -936,6 +1011,19 @@ def _run_query_first_to_api_flow(
                 "total_input_rows": len(projected_selected),
                 "total_output_rows": len(output_rows),
                 "sample_records": output_rows[:preview_row_limit],
+            }
+            full_dry_run_output: dict[str, Any] = {
+                "flow": flow_name,
+                "dry_run": True,
+                "source_query": source_sql,
+                "do_categorize": effective_do_categorize,
+                "applied_categorization": apply_categorization,
+                "categorized_columns": categorize_column_names,
+                "source_row_limit": source_row_limit,
+                "preview_row_limit": preview_row_limit,
+                "total_input_rows": len(projected_selected),
+                "total_output_rows": len(output_rows),
+                "records": output_rows,
             }
         else:
             dry_run_output = {
@@ -947,6 +1035,17 @@ def _run_query_first_to_api_flow(
                 "total_rows": len(output_rows),
                 "sample_rows": output_rows[:preview_row_limit],
             }
+            full_dry_run_output = {
+                "flow": flow_name,
+                "dry_run": True,
+                "source_query": source_sql,
+                "source_row_limit": source_row_limit,
+                "preview_row_limit": preview_row_limit,
+                "total_rows": len(output_rows),
+                "rows": output_rows,
+            }
+        _write_json_file(dry_run_output_path, full_dry_run_output)
+        dry_run_output["dry_run_output_path"] = dry_run_output_path
         print(_to_pretty_json(dry_run_output))
         return 0
 
@@ -957,7 +1056,7 @@ def _run_query_first_to_api_flow(
             "flow": flow_name,
             "dry_run": False,
             "source_query": source_sql,
-            "do_categorize": neutral.do_categorize,
+            "do_categorize": effective_do_categorize,
             "applied_categorization": apply_categorization,
             "categorized_columns": categorize_column_names,
             "source_row_limit": source_row_limit,
@@ -996,6 +1095,7 @@ def _run_categorize_to_api_mode(arguments: argparse.Namespace, dry_run: bool) ->
         arguments=arguments,
         dry_run=dry_run,
         categorization_mode=True,
+        force_do_categorize=getattr(arguments, "force_do_categorize", None),
         interactive_mode=bool(getattr(arguments, "interactive_mode", False)),
     )
 
@@ -1003,23 +1103,106 @@ def _run_categorize_to_api_mode(arguments: argparse.Namespace, dry_run: bool) ->
 def _run_categorization_only_mode(arguments: argparse.Namespace) -> int:
     neutral = load_neutral_runtime_config_from_env()
     database_url = _resolve_database_url(arguments, neutral)
+    source_sql = _require_source_query(_resolve_source_query(arguments, neutral))
     nim_api_key, nim_base_url, model = _resolve_llm_runtime(arguments, neutral)
     batch_size = _resolve_effective_batch_size(arguments, neutral)
+    source_row_limit = _resolve_source_row_limit(arguments, neutral)
+    interactive_mode = bool(getattr(arguments, "interactive_mode", False))
+
+    reader = PostgresReader(database_url=database_url)
+    source_rows, source_columns, source_sql = _fetch_source_rows_with_retry(
+        reader,
+        source_sql=source_sql,
+        interactive_mode=interactive_mode,
+    )
+    limited_source_rows = source_rows[:source_row_limit]
+    effective_raw_id_column = _resolve_effective_raw_id_column(
+        preferred_column=arguments.raw_id_column,
+        source_columns=source_columns,
+        source_rows=limited_source_rows,
+    )
+
+    target_columns: list[TargetColumn]
     if arguments.target_columns_json:
-        target_columns = _parse_manual_target_columns(arguments.target_columns_json)
+        parsed_specs = _parse_manual_target_columns(arguments.target_columns_json)
+        categorize_names = [str(spec["name"]) for spec in parsed_specs]
+        missing_specs = _find_missing_columns(source_columns, categorize_names)
+        if missing_specs:
+            available_text = ", ".join(source_columns)
+            raise ValueError(
+                "Column(s) not found in SOURCE_QUERY result: "
+                f"{', '.join(missing_specs)}. Valid column names: {available_text}"
+            )
+        target_columns = [TargetColumn.model_validate(spec) for spec in parsed_specs]
+    elif neutral.categorize_columns:
+        categorize_column_names = list(neutral.categorize_columns)
+        missing = _find_missing_columns(source_columns, categorize_column_names)
+        if missing:
+            if interactive_mode:
+                print(
+                    "Configured categorize columns not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing)}"
+                )
+                print("Switching to interactive categorized-column selection.")
+                categorize_column_names = _prompt_interactive_categorize_column_selection(
+                    source_columns=source_columns,
+                    source_rows=limited_source_rows,
+                    id_column=effective_raw_id_column,
+                )
+            else:
+                available_text = ", ".join(source_columns)
+                raise ValueError(
+                    "Column(s) not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing)}. Valid column names: {available_text}"
+                )
+        target_columns = [TargetColumn(name=name, description=None) for name in categorize_column_names]
+    elif arguments.categorized_columns is not None:
+        categorize_column_names = _parse_categorized_columns(
+            arguments.categorized_columns,
+            fallback_column=arguments.raw_value_column,
+        )
+        missing = _find_missing_columns(source_columns, categorize_column_names)
+        if missing:
+            if interactive_mode:
+                print(
+                    "Configured categorize columns not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing)}"
+                )
+                print("Switching to interactive categorized-column selection.")
+                categorize_column_names = _prompt_interactive_categorize_column_selection(
+                    source_columns=source_columns,
+                    source_rows=limited_source_rows,
+                    id_column=effective_raw_id_column,
+                )
+            else:
+                available_text = ", ".join(source_columns)
+                raise ValueError(
+                    "Column(s) not found in SOURCE_QUERY result: "
+                    f"{', '.join(missing)}. Valid column names: {available_text}"
+                )
+        target_columns = [TargetColumn(name=name, description=None) for name in categorize_column_names]
+    elif interactive_mode:
+        categorize_column_names = _prompt_interactive_categorize_column_selection(
+            source_columns=source_columns,
+            source_rows=limited_source_rows,
+            id_column=effective_raw_id_column,
+        )
+        target_columns = [TargetColumn(name=name, description=None) for name in categorize_column_names]
     else:
-        column_name = _prompt_text("Column name for categorization", arguments.raw_value_column)
-        column_description = _prompt_text("Column description (optional)", "")
-        target_columns = [{"name": column_name, "description": column_description or None}]
+        raise ValueError(
+            "At least one column to categorize is required: set CATEGORIZE_COLUMNS, "
+            "--categorized-columns, --target-columns-json, or run interactively."
+        )
 
     request = CategorizationRequest(
         database_url=database_url,
         target_columns=target_columns,
         batch_size=batch_size,
-        schema_name=arguments.schema_name,
-        table_name=arguments.table_name,
+        source_query=source_sql,
+        source_row_limit=source_row_limit,
+        prefetched_query_rows=limited_source_rows,
+        prefetched_query_columns=source_columns,
     )
-    reader = PostgresReader(database_url=database_url)
     categorizer = OpenAILLMCategorizer(
         api_key=nim_api_key,
         model=model,
@@ -1059,7 +1242,10 @@ def _run_manual_mode(arguments: argparse.Namespace) -> int:
         run_dry = _prompt_text("Dry run (yes/no)", "yes").lower() == "yes"
         print(f"Dry run: {'enabled' if run_dry else 'disabled'} (no API load when enabled)")
         return _run_categorize_to_api_mode(arguments, dry_run=run_dry)
-    return _run_categorization_only_mode(arguments=arguments)
+    neutral_manual = load_neutral_runtime_config_from_env()
+    arguments.source_sql = _interactive_acquire_source_sql(arguments, neutral_manual)
+    setattr(arguments, "interactive_mode", True)
+    return _run_categorization_only_mode(arguments)
 
 
 def main() -> int:
@@ -1076,19 +1262,23 @@ def main() -> int:
             if arguments.api_check_mode not in {"me", "account", "datasets"}:
                 raise ValueError("API check mode must be one of: me, account, datasets")
             return _run_api_check_mode(arguments)
-        if selected_mode in {"raw_to_api", "categorize_to_api"}:
+        if selected_mode in {"to_api", "raw_to_api", "categorize_to_api", "categorize_only"}:
             _configure_interactive_query_first_mode(arguments, selected_mode)
+        if selected_mode == "to_api":
+            setattr(arguments, "force_do_categorize", _resolve_interactive_to_api_do_categorize())
     else:
         setattr(arguments, "interactive_mode", False)
 
     if selected_mode == "api_check":
         return _run_api_check_mode(arguments)
+    if selected_mode == "to_api":
+        return _run_categorize_to_api_mode(arguments=arguments, dry_run=arguments.dry_run)
     if selected_mode == "raw_to_api":
         return _run_raw_to_api_mode(arguments=arguments, dry_run=arguments.dry_run)
     if selected_mode == "categorize_to_api":
         return _run_categorize_to_api_mode(arguments=arguments, dry_run=arguments.dry_run)
     if selected_mode == "categorize_only":
-        return _run_categorization_only_mode(arguments=arguments)
+        return _run_categorization_only_mode(arguments)
     return _run_manual_mode(arguments=arguments)
 
 
