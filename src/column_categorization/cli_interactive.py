@@ -268,25 +268,11 @@ def _prompt_interactive_categorize_column_selection(
     source_rows: list[dict[str, object]],
     id_column: str,
 ) -> list[str]:
-    suggestions = _suggest_categorize_columns(
-        source_columns=source_columns,
-        source_rows=source_rows,
-        id_column=id_column,
-        max_suggestions=3,
-    )
+    _ = source_rows, id_column
     print("Available columns from SOURCE_QUERY result:")
     for name in source_columns:
         print(f"  - {name}")
-    if suggestions:
-        print("Suggested columns to categorize:")
-        for name in suggestions:
-            print(f"  - {name}")
-    else:
-        print("No columns matched the suggestion heuristic (name keywords + first non-id text columns).")
-    if suggestions and _prompt_yes_no("Use suggested columns? (yes/no)"):
-        return list(suggestions)
-    default = ",".join(suggestions) if suggestions else ""
     return _read_validated_categorize_column_names(
         available_columns=source_columns,
-        default_line=default,
+        default_line="",
     )

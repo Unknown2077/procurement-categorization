@@ -786,3 +786,28 @@ def _run_categorize_to_api_mode(arguments: argparse.Namespace, dry_run: bool) ->
         force_do_categorize=getattr(arguments, "force_do_categorize", None),
         interactive_mode=bool(getattr(arguments, "interactive_mode", False)),
     )
+
+
+def _prepare_interactive_to_api_categorize_columns(arguments: argparse.Namespace) -> None:
+    if not bool(getattr(arguments, "interactive_mode", False)):
+        return
+    if not bool(getattr(arguments, "force_do_categorize", False)):
+        return
+    neutral = load_neutral_runtime_config_from_env()
+    if neutral.categorize_columns:
+        return
+    existing_columns = getattr(arguments, "categorized_columns", None)
+    if isinstance(existing_columns, str) and existing_columns.strip():
+        return
+    source_sql, source_columns, limited_source_rows, effective_raw_id_column = _query_first_fetch_source_and_resolve_base(
+        arguments,
+        neutral,
+        interactive_mode=True,
+    )
+    arguments.source_sql = source_sql
+    selected_columns = _prompt_interactive_categorize_column_selection(
+        source_columns=source_columns,
+        source_rows=limited_source_rows,
+        id_column=effective_raw_id_column,
+    )
+    arguments.categorized_columns = ",".join(selected_columns)

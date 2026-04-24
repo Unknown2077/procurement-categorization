@@ -28,7 +28,11 @@ from column_categorization.cli_interactive import (
     _prompt_text,
     _resolve_interactive_to_api_do_categorize,
 )
-from column_categorization.cli_query_first import _run_categorize_to_api_mode, _run_raw_to_api_mode
+from column_categorization.cli_query_first import (
+    _prepare_interactive_to_api_categorize_columns,
+    _run_categorize_to_api_mode,
+    _run_raw_to_api_mode,
+)
 from column_categorization.config import load_neutral_runtime_config_from_env
 
 
@@ -137,6 +141,7 @@ def _prepare_interactive_mode(arguments: argparse.Namespace, selected_mode: str)
         _configure_interactive_query_first_mode(arguments, selected_mode)
     if selected_mode == "to_api":
         setattr(arguments, "force_do_categorize", _resolve_interactive_to_api_do_categorize())
+        _prepare_interactive_to_api_categorize_columns(arguments)
     if selected_mode in {"to_api", "categorize_only", "api_check"}:
         neutral_preview = load_neutral_runtime_config_from_env()
         if selected_mode == "to_api":
